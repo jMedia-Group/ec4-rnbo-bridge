@@ -1,0 +1,30 @@
+{
+  "_comment": "Copy to config.json. Every key is optional; these are the defaults unless noted.",
+
+  "runner_host": "127.0.0.1",
+  "oscquery_port": 5678,
+  "osc_port": 1234,
+  "listen_port": 9123,
+  "listen_ip": "auto",
+
+  "midi_port": "EC4",
+  "ec4_setup": 16,
+  "setup_name": "RNBO",
+  "resolution": "7bit",
+  "encoder_mode": "Acc1",
+  "cc_base": 16,
+
+  "poll_interval": 2.0,
+  "feedback_holdoff_ms": 250,
+
+  "new_group_per_instance": true,
+  "include": [],
+  "exclude": ["^0/debug", "bypass"],
+  "names": { "0/cutoff": "Cut", "feedback": "FB" },
+  "group_names": { "0": "Syn", "1": "Echo" },
+
+  "backup_syx": "ec4-backup.syx",
+  "layout_syx": "ec4-layout.syx",
+  "layout_txt": "layout.txt",
+  "sysex_page_pause_ms": 2
+}
