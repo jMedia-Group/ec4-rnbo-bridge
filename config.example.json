@@ -12,6 +12,7 @@
   "setup_name": "RNBO",
   "resolution": "7bit",
   "encoder_mode": "Acc1",
+  "display": "100",
   "cc_base": 16,
 
   "poll_interval": 2.0,

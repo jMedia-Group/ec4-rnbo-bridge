@@ -47,6 +47,17 @@ SCALE_OFF = 0
 SCALE_100 = 2
 SCALE_1000 = 3
 
+# EC4 "Display" setting: config name -> code
+DISPLAY_SCALES = {
+    "off": 0, "127": 1, "100": 2, "1000": 3,
+    "+-63": 4, "+-50": 5, "+-500": 6, "onoff": 7, "9999": 8,
+}
+# which displays fit each resolution (the EC4 uses a 0..127 value range for the
+# small scales and the full 14-bit range for the large ones)
+DISPLAYS_7BIT = ("off", "127", "100", "+-63", "+-50", "onoff")
+DISPLAYS_14BIT = ("off", "1000", "+-500", "9999")
+DEFAULT_DISPLAY = {"7bit": "100", "14bit": "1000"}
+
 ENCODER_MODES = {
     "Div8": 0, "Div4": 1, "Div2": 2,
     "Acc0": 3, "Acc1": 4, "Acc2": 5, "Acc3": 6,
@@ -186,12 +197,13 @@ def read_names(dump: Dump, setup: int) -> dict:
 
 def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str],
                  encoder_names: list[list[str | None]], *, cc_base: int, resolution: str,
-                 mode: str) -> None:
+                 mode: str, display: str | None = None) -> None:
     """Program one setup (0-based) with the bridge's fixed MIDI scheme.
 
     Encoder e in group g sends CC (cc_base + e) on MIDI channel g+1, absolute mode.
     encoder_names[g][e] is a 4-char name, or None for an unused encoder (display off).
     Push buttons are switched off. Other setups are left untouched.
+    display is the EC4 value display (see DISPLAY_SCALES); None = default for the resolution.
     """
     if not 0 <= setup < 16:
         raise ValueError("setup must be 0..15")
@@ -202,6 +214,11 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
     if cc_base + 15 > 127:
         raise ValueError("cc_base too large")
     mode_code = ENCODER_MODES[mode]
+    display = display or DEFAULT_DISPLAY[resolution]
+    allowed = DISPLAYS_14BIT if resolution == "14bit" else DISPLAYS_7BIT
+    if display not in allowed:
+        raise ValueError(f"display '{display}' can't be used in {resolution} mode; use one of: {', '.join(allowed)}")
+    display_code = DISPLAY_SCALES[display]
     m = dump.memory
 
     a = ADDR_SETUP_NAMES + setup * 4
@@ -215,10 +232,10 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
             name = encoder_names[g][e] if g < len(encoder_names) and e < len(encoder_names[g]) else None
             used = name is not None
             if resolution == "14bit":
-                etype, scale = TYPE_CC_14BIT, SCALE_1000
+                etype, scale = TYPE_CC_14BIT, display_code
                 lower, upper, msbs = 0x00, 0xFF, 0xF0  # 0 .. 4095 (= 16383, full range)
             else:
-                etype, scale = TYPE_CC_ABS, SCALE_100
+                etype, scale = TYPE_CC_ABS, display_code
                 lower, upper, msbs = 0, 127, 0x00
             if not used:
                 scale = SCALE_OFF

@@ -46,6 +46,7 @@ DEFAULTS = {
     "setup_name": "RNBO",
     "resolution": "7bit",
     "encoder_mode": "Acc1",
+    "display": "",
     "cc_base": 16,
     "poll_interval": 2.0,
     "feedback_holdoff_ms": 250,
@@ -81,6 +82,12 @@ def load_config(path: str | None) -> dict:
         raise SystemExit("ec4_setup must be 1..16")
     if cfg["resolution"] not in ("7bit", "14bit"):
         raise SystemExit("resolution must be '7bit' or '14bit'")
+    disp = cfg["display"] = str(cfg["display"] or "").strip().lower()
+    if disp:
+        ok = ec4_sysex.DISPLAYS_14BIT if cfg["resolution"] == "14bit" else ec4_sysex.DISPLAYS_7BIT
+        if disp not in ok:
+            raise SystemExit(f"display '{disp}' can't be used with resolution {cfg['resolution']}; "
+                             f"use one of: {', '.join(ok)}")
     if cfg["encoder_mode"] not in ec4_sysex.ENCODER_MODES:
         raise SystemExit("encoder_mode must be one of " + ", ".join(ec4_sysex.ENCODER_MODES))
     top = 31 if cfg["resolution"] == "14bit" else 127
@@ -252,6 +259,7 @@ def write_layout_syx(cfg: dict, layout: Layout) -> bytes:
     ec4_sysex.apply_layout(
         dump, int(cfg["ec4_setup"]) - 1, cfg["setup_name"], layout.group_names, layout.encoder_names(),
         cc_base=int(cfg["cc_base"]), resolution=cfg["resolution"], mode=cfg["encoder_mode"],
+        display=cfg["display"] or None,
     )
     data = ec4_sysex.build_dump(dump)
     tmp = cfg["layout_syx"] + ".tmp"

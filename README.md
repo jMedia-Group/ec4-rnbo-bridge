@@ -103,6 +103,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `ec4_setup` | 16 | EC4 setup (1–16) used for RNBO |
 | `setup_name` | `RNBO` | setup name shown on the EC4 |
 | `resolution` | `7bit` | `7bit` (128 steps) or `14bit` (see below) |
+| `display` | `100` (7-bit), `1000` (14-bit) | how the EC4 shows values. 7-bit: `127`, `100`, `+-63`, `+-50`, `onoff`, `off`. 14-bit: `1000`, `+-500`, `9999`, `off` |
 | `encoder_mode` | `Acc1` | EC4 acceleration: `Acc0`–`Acc3`, `Div2/4/8`, `LSp2/4/6` |
 | `cc_base` | 16 | first CC number (CCs 16–31) |
 | `new_group_per_instance` | true | start each instance on a fresh group |

@@ -90,6 +90,20 @@ class SysexTests(unittest.TestCase):
         # and the result is still a valid dump
         sx.parse_dump(sx.build_dump(d))
 
+    def test_display_setting(self):
+        d = synthetic_dump()
+        names = [["Abcd"] * 16 for _ in range(16)]
+        b = sx._group_base(0, 0)
+        for disp, code in [("127", 1), ("+-63", 4), ("onoff", 7), ("off", 0), (None, 2)]:
+            sx.apply_layout(d, 0, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1", display=disp)
+            self.assertEqual(d.memory[b + 80] & 0xF, code, disp)
+        sx.apply_layout(d, 0, "R", [], names, cc_base=16, resolution="14bit", mode="Acc3", display="9999")
+        self.assertEqual(d.memory[b + 80] & 0xF, 8)
+        with self.assertRaises(ValueError):
+            sx.apply_layout(d, 0, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1", display="1000")
+        with self.assertRaises(ValueError):
+            sx.apply_layout(d, 0, "R", [], names, cc_base=16, resolution="14bit", mode="Acc1", display="127")
+
     def test_14bit_limits(self):
         d = synthetic_dump()
         names = [["Abcd"] * 16 for _ in range(16)]
