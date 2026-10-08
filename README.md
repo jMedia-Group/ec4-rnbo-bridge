@@ -18,8 +18,9 @@ EC4 names   ◀── SysEx setup dump (on demand: `send-layout`)
 - Encoder *e* in group *g* sends **CC (16 + e − 1) on MIDI channel g**. The scheme never
   changes, so encoders keep working after you load a different patcher, even before the names
   are updated.
-- Names are shortened to the EC4's 4 characters (`cutoff` → `Cutf`, `resonance` → `Resn`,
-  `osc2Level` → `Os2L`). Group names come from the instance name (`Pol1`, `Pol2` when an instance
+- Names are shortened to the EC4's 4 characters (`cutoff` → `cutf`, `resonance` → `resn`,
+  `osc2Level` → `os2L`), keeping the capitalization they have in RNBO.
+  Group names come from the instance name (`pol1`, `pol2` when an instance
   spans two groups). You can override any of them in `config.json`.
 
 `python3 ec4bridge.py list` prints the current layout. While the bridge runs it also writes the
@@ -110,7 +111,8 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `include` / `exclude` | `[]` | regexes matched against `inst/param-id` and the display name |
 | `names` | `{}` | 4-char overrides, keyed by `"0/cutoff"` or just `"cutoff"` |
 | `group_names` | `{}` | group name per instance index, e.g. `{"0": "Syn"}` |
-| `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `Revr` |
+| `name_case` | `keep` | capitalization of shortened names: `keep` (as written in RNBO), `title` (`Cutf`), `upper` (`CUTF`), `lower` (`cutf`). Names you type in `names`/`group_names` are always used exactly as typed |
+| `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |
 | `feedback_holdoff_ms` | 250 | don't echo a value back to an encoder you're turning |
 | `poll_interval` | 2.0 | seconds between OSCQuery scans (patch changes, missed values) |
 

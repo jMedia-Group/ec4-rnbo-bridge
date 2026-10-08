@@ -24,6 +24,7 @@
   "names": { "0/cutoff": "Cut", "feedback": "FB" },
   "group_names": { "0": "Syn", "1": "Echo" },
   "strip_prefixes": ["j."],
+  "name_case": "keep",
 
   "backup_syx": "ec4-backup.syx",
   "layout_syx": "ec4-layout.syx",

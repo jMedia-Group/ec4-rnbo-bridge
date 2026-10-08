@@ -29,15 +29,35 @@ def _words(name: str) -> list[str]:
     return re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", name)
 
 
-def abbreviate(name: str, n: int = 4) -> str:
+NAME_CASES = ("keep", "title", "upper", "lower")
+
+
+def _cap(s: str, case: str) -> str:
+    return s[:1].upper() + s[1:] if case == "title" else s
+
+
+def apply_case(s: str, case: str) -> str:
+    if case == "upper":
+        return s.upper()
+    if case == "lower":
+        return s.lower()
+    return s
+
+
+def abbreviate(name: str, n: int = 4, case: str = "keep") -> str:
+    """Shorten a name to n chars. case: 'keep' (as in RNBO), 'title' (capitalize each
+    word), 'upper' or 'lower'."""
+    return apply_case(_abbreviate(name, n, case), case)
+
+
+def _abbreviate(name: str, n: int, case: str) -> str:
     words = _words(name)
     if not words:
         return (re.sub(r"[^0-9A-Za-z./-]", "", name) or "?")[:n]
     if len(words) == 1:
-        w = words[0]
-        return _squeeze(w, n)[:1].upper() + _squeeze(w, n)[1:]
+        return _cap(_squeeze(words[0], n), case)
     if len(words) >= n:
-        return "".join(w[0].upper() for w in words[:n])
+        return "".join(_cap(w[0], case) for w in words[:n])
     # share n chars across the words, earlier words get the remainder
     k = len(words)
     sizes = [n // k + (1 if i < n % k else 0) for i in range(k)]
@@ -51,7 +71,7 @@ def abbreviate(name: str, n: int = 4) -> str:
         if i == 0:
             size += spare
         p = w if w.isdigit() else _squeeze(w, size)
-        parts.append(p[:1].upper() + p[1:size])
+        parts.append(_cap(p[:size], case))
     return "".join(parts)[:n]
 
 
@@ -115,6 +135,7 @@ def build_layout(params: list[Param], cfg: dict) -> Layout:
     group_overrides: dict = cfg.get("group_names") or {}
     new_group_per_instance = cfg.get("new_group_per_instance", True)
     prefixes = cfg.get("strip_prefixes") or []
+    case = cfg.get("name_case") or "keep"
 
     chosen = [p for p in params if (not include or _matches(include, p)) and not _matches(exclude, p)]
 
@@ -132,7 +153,7 @@ def build_layout(params: list[Param], cfg: dict) -> Layout:
             continue
         if group_owner[g] is None:
             group_owner[g] = (p.inst, p.inst_name)
-        short = name_overrides.get(p.key) or name_overrides.get(p.pid) or abbreviate(strip_prefixes(p.label, prefixes))
+        short = name_overrides.get(p.key) or name_overrides.get(p.pid) or abbreviate(strip_prefixes(p.label, prefixes), case=case)
         slots.append(Slot(g, e, p, short[:4]))
         e += 1
         if e == 16:
@@ -159,10 +180,10 @@ def build_layout(params: list[Param], cfg: dict) -> Layout:
         pages[inst] = pages.get(inst, 0) + 1
         ov = group_overrides.get(str(inst))
         if span[inst] > 1:
-            base = (ov or abbreviate(iname, 3))[:3]
+            base = (ov or abbreviate(iname, 3, case))[:3]
             group_names[grp] = base + (str(pages[inst]) if pages[inst] < 10 else SUFFIX_CHARS[pages[inst] - 2])
         else:
-            group_names[grp] = (ov or abbreviate(iname))[:4]
+            group_names[grp] = (ov or abbreviate(iname, case=case))[:4]
     return Layout(slots, group_names, skipped)
 
 

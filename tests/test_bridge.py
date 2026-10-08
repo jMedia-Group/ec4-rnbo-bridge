@@ -140,7 +140,7 @@ class LayoutTests(unittest.TestCase):
         for s in lay.slots:
             groups.setdefault(s.group, []).append(s)
         self.assertEqual([len(groups[g]) for g in sorted(groups)], [16, 4, 3])
-        self.assertEqual(lay.group_names[:4], ["Pol1", "Pol2", "Dely", ""])
+        self.assertEqual(lay.group_names[:4], ["pol1", "pol2", "Dely", ""])
         for g in groups.values():
             names = [s.short.lower() for s in g]
             self.assertEqual(len(names), len(set(names)), names)
@@ -157,10 +157,10 @@ class LayoutTests(unittest.TestCase):
         from mock_runner import make_instance
         tree = {"CONTENTS": {"0": make_instance(0, "j.reverb", [("j.size", 0, 0.5), ("decay", 1, 0.5)])}}
         lay = build_layout(parse_params(tree), cfg(strip_prefixes=["j."]))
-        self.assertEqual(lay.group_names[0], "Revr")
-        self.assertEqual([s.short for s in lay.slots], ["Size", "Decy"])
+        self.assertEqual(lay.group_names[0], "revr")
+        self.assertEqual([s.short for s in lay.slots], ["size", "decy"])
         lay = build_layout(parse_params(tree), cfg())
-        self.assertEqual(lay.group_names[0], "JRe")  # without the option
+        self.assertEqual(lay.group_names[0], "jre")  # without the option
 
     def test_overflow(self):
         many = parse_params(default_tree()) * 13  # 299 params
@@ -169,10 +169,26 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(len(lay.skipped), len(many) - 256)
 
     def test_abbreviate(self):
-        self.assertEqual(abbreviate("cutoff"), "Cutf")
-        self.assertEqual(abbreviate("resonance"), "Resn")
-        self.assertEqual(abbreviate("osc2Level"), "Os2L")
-        self.assertEqual(abbreviate("mix"), "Mix")
+        # default keeps the case from RNBO
+        self.assertEqual(abbreviate("cutoff"), "cutf")
+        self.assertEqual(abbreviate("Cutoff"), "Cutf")
+        self.assertEqual(abbreviate("resonance"), "resn")
+        self.assertEqual(abbreviate("osc2Level"), "os2L")
+        self.assertEqual(abbreviate("LFO"), "LFO")
+        self.assertEqual(abbreviate("mix"), "mix")
+        self.assertEqual(abbreviate("Filter Env Amount"), "FiEA")
+        self.assertEqual(abbreviate("filter env amount"), "fiea")
+        # other styles
+        self.assertEqual(abbreviate("cutoff", case="title"), "Cutf")
+        self.assertEqual(abbreviate("osc2Level", case="title"), "Os2L")
+        self.assertEqual(abbreviate("cutoff", case="upper"), "CUTF")
+        self.assertEqual(abbreviate("LFO", case="lower"), "lfo")
+
+    def test_name_case_setting(self):
+        lay = build_layout(self.params, cfg(name_case="upper", names={"0/cutoff": "Filt"}))
+        self.assertEqual(lay.group_names[:3], ["POL1", "POL2", "DELY"])
+        self.assertEqual(next(s for s in lay.slots if s.param.pid == "cutoff").short, "Filt")  # typed as-is
+        self.assertEqual(next(s for s in lay.slots if s.param.pid == "mix").short, "MIX")
 
 
 class BridgeTests(unittest.TestCase):
@@ -353,7 +369,7 @@ class CliTests(unittest.TestCase):
                 r = subprocess.run([sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf, "list"],
                                    capture_output=True, text=True, timeout=20)
                 self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertIn("Group  1 [Pol1]", r.stdout)
+                self.assertIn("Group  1 [pol1]", r.stdout)
                 self.assertIn("env/attack", r.stdout)
                 r = subprocess.run([sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf, "make-syx"],
                                    capture_output=True, text=True, timeout=20)
@@ -361,8 +377,8 @@ class CliTests(unittest.TestCase):
                 with open(os.path.join(d, "ec4-layout.syx"), "rb") as f:
                     out = sx.parse_dump(f.read())
                 names = sx.read_names(out, 15)
-                self.assertEqual(names["groups"][:3], ["Pol1", "Pol2", "Dely"])
-                self.assertEqual(names["encoders"][2][:3], ["Time", "Fedb", "Mix "])
+                self.assertEqual(names["groups"][:3], ["pol1", "pol2", "Dely"])
+                self.assertEqual(names["encoders"][2][:3], ["time", "fedb", "mix "])
         finally:
             runner.close()
 

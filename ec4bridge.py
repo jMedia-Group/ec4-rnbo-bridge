@@ -56,6 +56,7 @@ DEFAULTS = {
     "names": {},
     "group_names": {},
     "strip_prefixes": [],
+    "name_case": "keep",
     "backup_syx": "ec4-backup.syx",
     "layout_syx": "ec4-layout.syx",
     "layout_txt": "layout.txt",
@@ -88,6 +89,10 @@ def load_config(path: str | None) -> dict:
         if disp not in ok:
             raise SystemExit(f"display '{disp}' can't be used with resolution {cfg['resolution']}; "
                              f"use one of: {', '.join(ok)}")
+    from layout import NAME_CASES
+    cfg["name_case"] = str(cfg["name_case"] or "keep").strip().lower()
+    if cfg["name_case"] not in NAME_CASES:
+        raise SystemExit("name_case must be one of " + ", ".join(NAME_CASES))
     if cfg["encoder_mode"] not in ec4_sysex.ENCODER_MODES:
         raise SystemExit("encoder_mode must be one of " + ", ".join(ec4_sysex.ENCODER_MODES))
     top = 31 if cfg["resolution"] == "14bit" else 127
