@@ -96,6 +96,14 @@ class Layout:
         return grid
 
 
+def strip_prefixes(name: str, prefixes: list[str]) -> str:
+    """Remove the first matching prefix (case-insensitive), e.g. 'j.reverb' -> 'reverb'."""
+    for pre in prefixes:
+        if pre and name.lower().startswith(pre.lower()) and len(name) > len(pre):
+            return name[len(pre):]
+    return name
+
+
 def _matches(patterns: list[str], p: Param) -> bool:
     return any(re.search(pat, p.key) or re.search(pat, p.label) for pat in patterns)
 
@@ -106,6 +114,7 @@ def build_layout(params: list[Param], cfg: dict) -> Layout:
     name_overrides: dict = cfg.get("names") or {}
     group_overrides: dict = cfg.get("group_names") or {}
     new_group_per_instance = cfg.get("new_group_per_instance", True)
+    prefixes = cfg.get("strip_prefixes") or []
 
     chosen = [p for p in params if (not include or _matches(include, p)) and not _matches(exclude, p)]
 
@@ -123,7 +132,7 @@ def build_layout(params: list[Param], cfg: dict) -> Layout:
             continue
         if group_owner[g] is None:
             group_owner[g] = (p.inst, p.inst_name)
-        short = name_overrides.get(p.key) or name_overrides.get(p.pid) or abbreviate(p.label)
+        short = name_overrides.get(p.key) or name_overrides.get(p.pid) or abbreviate(strip_prefixes(p.label, prefixes))
         slots.append(Slot(g, e, p, short[:4]))
         e += 1
         if e == 16:
@@ -146,6 +155,7 @@ def build_layout(params: list[Param], cfg: dict) -> Layout:
         if not owner:
             continue
         inst, iname = owner
+        iname = strip_prefixes(iname, prefixes)
         pages[inst] = pages.get(inst, 0) + 1
         ov = group_overrides.get(str(inst))
         if span[inst] > 1:

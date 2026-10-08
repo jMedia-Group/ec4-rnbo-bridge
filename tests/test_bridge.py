@@ -139,6 +139,15 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(next(s for s in lay.slots if s.param.pid == "cutoff").short, "Filt")
         self.assertEqual({s.group for s in lay.slots}, {0})  # packed into one group
 
+    def test_strip_prefixes(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {"0": make_instance(0, "j.reverb", [("j.size", 0, 0.5), ("decay", 1, 0.5)])}}
+        lay = build_layout(parse_params(tree), cfg(strip_prefixes=["j."]))
+        self.assertEqual(lay.group_names[0], "Revr")
+        self.assertEqual([s.short for s in lay.slots], ["Size", "Decy"])
+        lay = build_layout(parse_params(tree), cfg())
+        self.assertEqual(lay.group_names[0], "JRe")  # without the option
+
     def test_overflow(self):
         many = parse_params(default_tree()) * 13  # 299 params
         lay = build_layout(many, cfg(new_group_per_instance=False))

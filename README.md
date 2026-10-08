@@ -109,6 +109,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `include` / `exclude` | `[]` | regexes matched against `inst/param-id` and the display name |
 | `names` | `{}` | 4-char overrides, keyed by `"0/cutoff"` or just `"cutoff"` |
 | `group_names` | `{}` | group name per instance index, e.g. `{"0": "Syn"}` |
+| `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `Revr` |
 | `feedback_holdoff_ms` | 250 | don't echo a value back to an encoder you're turning |
 | `poll_interval` | 2.0 | seconds between OSCQuery scans (patch changes, missed values) |
 

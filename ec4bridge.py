@@ -54,6 +54,7 @@ DEFAULTS = {
     "exclude": [],
     "names": {},
     "group_names": {},
+    "strip_prefixes": [],
     "backup_syx": "ec4-backup.syx",
     "layout_syx": "ec4-layout.syx",
     "layout_txt": "layout.txt",
