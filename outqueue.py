@@ -4,7 +4,7 @@ Everything sent to the EC4 goes through one background thread, so the thread tha
 encoder turns never waits for the EC4.
 
 Display text is the expensive part: the EC4 takes ~80 ms to process each display message
-(it answers each one with a short SysEx reply), and while it's busy it also delays sending
+(it answers each one with F0 00 00 00 4E 2C 1B F7, seen with `ec4bridge.py monitor`), and while it's busy it also delays sending
 encoder data. So display text is not queued message by message. Instead the queue keeps the
 *desired* contents of each screen and sends one message at a time with only the characters
 that changed (like DrivenByMoss does), waiting for the EC4's reply (or a short timeout) before

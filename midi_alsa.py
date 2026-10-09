@@ -12,7 +12,10 @@ import threading
 import time
 from typing import Callable
 
+from ec4_remote import HEADER
 from outqueue import OutQueue
+
+ACK = HEADER + b"\xf7"  # F0 00 00 00 4E 2C 1B F7: the EC4's reply to a display message
 
 from alsa_midi import (
     ControlChangeEvent,
@@ -204,7 +207,8 @@ class EC4Midi:
                 if data[-1:] == b"\xf7":
                     msg = bytes(self._sysex_buf)
                     self._sysex_buf = bytearray()
-                    self._queue.ack()  # the EC4 replies to each display message
+                    if msg == ACK:
+                        self._queue.ack()  # the EC4's reply to each display message
                     if self.on_sysex:
                         self.on_sysex(msg)
 

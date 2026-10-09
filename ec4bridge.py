@@ -72,6 +72,9 @@ DEFAULTS = {
     "zero_unused": True,
     "value_popup": True,
     "value_popup_seconds": 1.5,
+    "value_popup_mode": "rest",
+    "value_popup_rest_ms": 120,
+    "value_popup_interval_ms": 250,
     "units": {},
     "notify_graph_change": True,
     "notify_seconds": 2.5,
@@ -135,6 +138,9 @@ def load_config(path: str | None) -> dict:
     key = cfg["device_list_key"] = str(cfg["device_list_key"] or "off").strip().lower().replace(" ", "")
     if parse_list_key(key) is None and key != "off":
         raise SystemExit('device_list_key must be "shift+1".."shift+16", "user1".."user4" or "off"')
+    cfg["value_popup_mode"] = str(cfg["value_popup_mode"] or "rest").strip().lower()
+    if cfg["value_popup_mode"] not in ("rest", "live"):
+        raise SystemExit('value_popup_mode must be "rest" or "live"')
     cfg["device_list_mode"] = str(cfg["device_list_mode"] or "momentary").strip().lower()
     if cfg["device_list_mode"] not in ("momentary", "toggle"):
         raise SystemExit('device_list_mode must be "momentary" or "toggle"')
@@ -199,6 +205,7 @@ class Bridge:
         self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
         self._popup_pending: tuple[Slot, object] | None = None
         self._popup_last = 0.0
+        self._last_turn = 0.0  # when any encoder last moved
         self._popup_timer: threading.Timer | None = None
         self._overlay_visible = False
         self._overlay_owner = None
@@ -467,17 +474,33 @@ class Bridge:
         return [p.label[:20], value[:20], bar, device[:20]]
 
     def value_popup(self, slot: Slot, raw):
-        """Full parameter name, value, bar and device on the overlay (throttled to ~12/s)."""
+        """Full parameter name, value, bar and device on the overlay.
+
+        The EC4 stops sending encoder data while it draws, so by default ("rest") the pop-up
+        is only drawn once the knob pauses; "live" redraws at most every value_popup_interval_ms
+        while turning.
+        """
         if not self.cfg.get("value_popup", True) or self._list_held:
             return
         if not self.on_my_setup() or self.paused() or self.midi is None:
             return
         self._popup_pending = (slot, raw)
-        wait = 0.08 - (time.monotonic() - self._popup_last)
+        self._popup_tick()
+
+    def _popup_due(self) -> float:
+        if self.cfg.get("value_popup_mode", "rest") == "rest":
+            return self._last_turn + float(self.cfg.get("value_popup_rest_ms", 120)) / 1000.0
+        return self._popup_last + float(self.cfg.get("value_popup_interval_ms", 250)) / 1000.0
+
+    def _popup_tick(self, from_timer: bool = False):
+        if self._popup_pending is None:
+            return
+        wait = self._popup_due() - time.monotonic()
         if wait <= 0:
             self._flush_popup()
-        elif not (self._popup_timer and self._popup_timer.is_alive()):
-            self._popup_timer = threading.Timer(wait, self._flush_popup)
+        elif from_timer or not (self._popup_timer and self._popup_timer.is_alive()):
+            # (inside the timer's own callback it still counts as alive, so always re-arm there)
+            self._popup_timer = threading.Timer(wait, self._popup_tick, kwargs={"from_timer": True})
             self._popup_timer.daemon = True
             self._popup_timer.start()
 
@@ -625,7 +648,7 @@ class Bridge:
                 return
             k = slot.param.key
             self.values[k] = norm
-            self.touched[k] = time.monotonic()
+            self.touched[k] = self._last_turn = time.monotonic()
             addr = slot.param.address
         if self.osc_send:
             self.osc_send(addr, float(norm))

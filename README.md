@@ -114,7 +114,9 @@ polysynth
 The value is RNBO's real value, as reported back by the runner (enums show their label), with
 its unit: set it on the parameter in your patch (`param cutoff @unit Hz`), or in `units` in
 `config.json`. It
-disappears 1.5 s after you stop turning (`value_popup`, `value_popup_seconds`).
+appears as soon as the knob pauses (the EC4 can't send knob data while it's drawing, so
+nothing is drawn while you turn) and disappears 1.5 s later (`value_popup`,
+`value_popup_mode`, `value_popup_seconds`).
 
 To check, run `venv/bin/python ec4bridge.py test-display` with the EC4 on the RNBO setup. It asks
 the EC4 which setup it's on, shows a test message for 4 seconds, then writes `T01`…`T16` as encoder
@@ -186,6 +188,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `notify_group_change` | `true` | pop up the instance name when you switch groups |
 | `value_popup` | `true` | while you turn an encoder, show its full name, value, a level bar and the device |
 | `units` | `{}` | units shown after values in the pop-up, keyed like `names` (`{"0/cutoff": "Hz", "attack": "ms"}`); overrides the unit from RNBO |
+| `value_popup_mode` | `rest` | `rest`: draw the pop-up once the knob pauses (`value_popup_rest_ms`, 120); `live`: also redraw while turning, at most every `value_popup_interval_ms` (250). The EC4 stops sending knob data while it draws, so `live` makes knobs less smooth |
 | `value_popup_seconds` | 1.5 | how long that stays after you stop turning |
 | `zero_unused` | `true` | set every encoder without a parameter to 0 (on a new graph, at start-up and when you return to the RNBO setup), so no values are left over from the previous graph |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |

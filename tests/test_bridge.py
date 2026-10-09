@@ -807,6 +807,8 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
         b.on_cc(0, 17, 127)  # group 1 encoder 2 = cutoff, turned to max
+        self.assertEqual(self.overlays(), [])  # nothing drawn while the knob is moving
+        time.sleep(0.2)  # knob rests
         ov = self.overlays()
         self.assertEqual(len(ov), 1)
         rows = [ov[0][i:i + 20].rstrip() for i in range(0, 80, 20)]
@@ -823,7 +825,7 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertEqual(len(last), 13 + 40 * 3 + 1)
 
     def test_value_popup_enum_and_throttle(self):
-        b = self.make()
+        b = self.make(value_popup_mode="live", value_popup_interval_ms=80)
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
         b.on_cc(0, 21, 127)  # wave (enum) -> "square"
@@ -834,6 +836,20 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertEqual(len(self.overlays()), 2)
         self.assertEqual(self.overlays()[1][20:40].rstrip(), "sine")
         self.assertEqual(self.overlays()[1][:20].rstrip(), "wave")  # name still on screen
+
+    def test_value_popup_waits_until_knob_rests(self):
+        b = self.make()  # default mode: rest
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        for v in range(40, 80):  # a 0.4 s turn
+            b.on_cc(0, 17, v)
+            time.sleep(0.01)
+            self.assertEqual(self.overlays(), [])  # the EC4 is never asked to draw mid-turn
+        time.sleep(0.2)
+        ov = self.overlays()
+        self.assertEqual(len(ov), 1)  # one pop-up, with where the knob ended up
+        self.assertEqual(ov[0][40:60].rstrip(), "#" * round(79 / 127 * 15) + "." * (15 - round(79 / 127 * 15))
+                         + f"{round(79 / 127 * 100):>4}%")
 
     def test_value_popup_not_for_runner_changes_or_when_off(self):
         b = self.make()

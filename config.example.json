@@ -41,6 +41,8 @@
   "zero_unused": true,
   "value_popup": true,
   "value_popup_seconds": 1.5,
+  "value_popup_mode": "rest",
+  "value_popup_rest_ms": 120,
   "units": { "0/cutoff": "Hz" },
 
   "backup_syx": "ec4-backup.syx",
