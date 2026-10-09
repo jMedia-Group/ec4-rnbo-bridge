@@ -122,8 +122,8 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
 
 ## Commands
 
-sudo systemctl restart ec4bridge
-venv/bin/python ec4bridge.py send-layout
+- sudo systemctl restart ec4bridge
+- venv/bin/python ec4bridge.py send-layout
 
 ## Troubleshooting
 
