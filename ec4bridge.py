@@ -68,6 +68,7 @@ DEFAULTS = {
     "sysex_page_pause_ms": 2,
     "live_names": True,
     "live_names_refresh": 0,
+    "zero_unused": True,
     "notify_graph_change": True,
     "notify_seconds": 2.5,
     "notify_group_change": True,
@@ -504,12 +505,15 @@ class Bridge:
             self._feedback(slot, v)
 
     def _cc_messages(self, slot: Slot, v: float) -> list[tuple[int, int, int]]:
+        return self._encoder_ccs(slot.group, slot.encoder, v)
+
+    def _encoder_ccs(self, group: int, encoder: int, v: float) -> list[tuple[int, int, int]]:
         v = min(1.0, max(0.0, v))
-        cc = self.cc_base + slot.encoder
+        cc = self.cc_base + encoder
         if self.hi_res:
             x = round(v * 16383)
-            return [(slot.group, cc, x >> 7), (slot.group, cc + 32, x & 0x7F)]
-        return [(slot.group, cc, round(v * 127))]
+            return [(group, cc, x >> 7), (group, cc + 32, x & 0x7F)]
+        return [(group, cc, round(v * 127))]
 
     def _feedback(self, slot: Slot, v: float):
         if self.midi is None or not self.on_my_setup() or self.paused():
@@ -525,6 +529,13 @@ class Bridge:
             msgs = []
             for s in self.layout.slots:
                 msgs += self._cc_messages(s, self.values.get(s.param.key, s.param.normalized))
+            if self.cfg.get("zero_unused", True):
+                # encoders with no parameter (e.g. left over from the previous graph) go to 0
+                used = {(s.group, s.encoder) for s in self.layout.slots}
+                for g in range(16):
+                    for e in range(16):
+                        if (g, e) not in used:
+                            msgs += self._encoder_ccs(g, e, 0.0)
         self.midi.send_ccs(msgs)
 
 

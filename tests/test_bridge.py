@@ -287,8 +287,30 @@ class BridgeTests(unittest.TestCase):
 
     def test_resync_on_layout(self):
         self.make()
-        self.assertEqual(len(self.midi.sent), 23)
+        self.assertEqual(len(self.midi.sent), 256)  # 23 parameters + 233 unused encoders
         self.assertIn((0, 16, round(0.8 * 127)), self.midi.sent)  # volume, group 1 enc 1
+        self.assertIn((1, 20, 0), self.midi.sent)  # group 2 encoder 5: unused -> 0
+        self.assertIn((15, 31, 0), self.midi.sent)  # group 16 encoder 16: unused -> 0
+        self.assertNotIn((0, 16, 0), self.midi.sent)  # used encoders are not zeroed
+
+    def test_zero_unused_off(self):
+        self.make(zero_unused=False)
+        self.assertEqual(len(self.midi.sent), 23)
+
+    def test_new_graph_zeroes_leftovers(self):
+        b = self.make()
+        self.midi.sent.clear()
+        tree = default_tree()
+        tree["CONTENTS"].pop("0")  # new graph: only the 3-parameter delay
+        b.update_from_params(parse_params(tree))
+        self.assertIn((0, 19, 0), self.midi.sent)  # group 1 encoder 4 had a synth parameter -> 0
+        self.assertIn((1, 16, 0), self.midi.sent)  # old second synth page -> 0
+        self.assertIn((0, 16, 16), self.midi.sent)  # delay time moved here: 250 of 0..2000 -> 16
+
+    def test_zero_unused_14bit(self):
+        self.make(resolution="14bit")
+        self.assertIn((5, 16, 0), self.midi.sent)
+        self.assertIn((5, 48, 0), self.midi.sent)  # MSB and LSB
 
     def test_encoder_to_osc(self):
         b = self.make()
@@ -402,7 +424,7 @@ class RunLoopTest(unittest.TestCase):
                     time.sleep(0.05)
                 # listener registered with the runner, all values sent to the EC4
                 self.assertIn(("/rnbo/listeners/add", (f"127.0.0.1:{listen_port}",)), got)
-                self.assertEqual(len(fake.sent), 23)
+                self.assertEqual(len(fake.sent), 256)
                 # turn an encoder -> OSC to the runner
                 fake.on_cc(0, 17, 127)
                 for _ in range(50):
@@ -536,7 +558,7 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertEqual(self.midi.sent, [])
         self.assertEqual(self.names_written(), [])
         b.on_sysex(report(15, 0))  # back on the RNBO setup -> values + names resent
-        self.assertEqual(len(self.midi.sent), 23)
+        self.assertEqual(len(self.midi.sent), 256)
         self.assertEqual(len(self.names_written()), 1)
         b.on_cc(0, 16, 127)
         self.assertEqual(self.osc[-1], ("/rnbo/inst/0/params/volume/normalized", 1.0))

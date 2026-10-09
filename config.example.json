@@ -38,6 +38,7 @@
   "device_list_mode": "momentary",
   "device_list_page_seconds": 2,
   "live_names_refresh": 0,
+  "zero_unused": true,
 
   "backup_syx": "ec4-backup.syx",
   "layout_syx": "ec4-layout.syx",

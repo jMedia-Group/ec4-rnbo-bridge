@@ -167,6 +167,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `device_list_page_seconds` | 2 | momentary mode: how fast pages flip while held (more than 8 groups) |
 | `device_list_seconds` | 8 | toggle mode: how long the list stays up; momentary mode: safety timeout |
 | `notify_group_change` | `true` | pop up the instance name when you switch groups |
+| `zero_unused` | `true` | set every encoder without a parameter to 0 (on a new graph, at start-up and when you return to the RNBO setup), so no values are left over from the previous graph |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |
 | `feedback_holdoff_ms` | 250 | don't echo a value back to an encoder you're turning |
