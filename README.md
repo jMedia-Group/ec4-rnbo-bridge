@@ -225,6 +225,11 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
      on its own: stop the bridge (`sudo systemctl stop ec4bridge`), close the web interface, and run
      `venv/bin/python ec4bridge.py runner-check` (60 s; `--seconds N` to change). It asks the runner
      for one small value every 0.25 s and prints every answer slower than 200 ms, with the time.
+  7. To see how many parameter changes per second the runner can take, with no EC4 and no bridge
+     involved: stop the bridge and run `venv/bin/python ec4bridge.py runner-stress 1/mix` (any
+     parameter key from `list`; run it without one to see them). It sweeps that parameter between
+     20% and 80% at 10, 30 and 60 changes a second (`--rates`), 15 s each (`--seconds`), sets it
+     back, and says at which rate the runner falls behind and what `osc_send_interval_ms` to use.
 
 - **"Receive error" on the EC4 during `send-layout`**: something else reached the EC4 in the middle
   of the dump. `send-layout` and `capture-backup` pause a running bridge service automatically

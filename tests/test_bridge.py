@@ -1425,6 +1425,81 @@ class TraceTests(unittest.TestCase):
         finally:
             runner.close()
 
+
+    def run_stress(self, cost):
+        """runner-stress against a mock runner that needs `cost` seconds per parameter change."""
+        import queue as q
+        from pythonosc.dispatcher import Dispatcher
+        from pythonosc.osc_server import BlockingOSCUDPServer
+        from pythonosc.udp_client import SimpleUDPClient
+        runner = MockRunner()
+        listeners, work, clients = [], q.Queue(), {}
+
+        def on(addr, *a):
+            if addr == "/rnbo/listeners/add":
+                listeners.append(a[0])
+            elif addr.endswith("/normalized"):
+                work.put((addr, a[0]))
+
+        def worker():
+            while True:
+                addr, v = work.get()
+                if addr is None:
+                    return
+                time.sleep(cost)
+                for li in listeners:
+                    if li not in clients:
+                        ip, port = li.rsplit(":", 1)
+                        clients[li] = SimpleUDPClient(ip, int(port))
+                    clients[li].send_message(addr, v)
+
+        disp = Dispatcher()
+        disp.set_default_handler(on)
+        osc = BlockingOSCUDPServer(("127.0.0.1", 0), disp)
+        threading.Thread(target=osc.serve_forever, daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                conf = os.path.join(d, "config.json")
+                with open(conf, "w") as f:
+                    json.dump({"oscquery_port": runner.port, "osc_port": osc.server_address[1],
+                               "listen_port": 39123}, f)
+                r = subprocess.run([sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf,
+                                    "runner-stress", "1/mix", "--rates", "10,60", "--seconds", "2"],
+                                   capture_output=True, text=True, timeout=60)
+            return r
+        finally:
+            work.put((None, None))
+            osc.server_close()
+            runner.close()
+
+    def test_runner_stress_keeps_up(self):
+        r = self.run_stress(0.002)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Sweeping 1/mix (mix) on 'Delay'", r.stdout)
+        self.assertIn("kept up at every rate", r.stdout)
+
+    def test_runner_stress_falls_behind(self):
+        r = self.run_stress(0.03)  # at most ~33 changes a second
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("keeps up at 10 changes per second but falls behind at 60", r.stdout)
+        self.assertIn('"osc_send_interval_ms" to 100', r.stdout)
+
+    def test_runner_stress_lists_parameters(self):
+        runner = MockRunner()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                conf = os.path.join(d, "config.json")
+                with open(conf, "w") as f:
+                    json.dump({"oscquery_port": runner.port}, f)
+                r = subprocess.run([sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf,
+                                    "runner-stress"], capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("1/mix", r.stdout)
+            self.assertIn("safe to sweep", r.stdout)
+        finally:
+            runner.close()
+
     def test_no_recording_when_idle(self):
         b = Bridge(cfg(), midi=FakeMidi())
         b.on_cc(0, 16, 1)

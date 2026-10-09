@@ -16,6 +16,7 @@ Subcommands:
   monitor          show what the EC4 sends as you turn encoders (timing, skipped steps)
   trace            record what the running bridge does for a few seconds, and where it lags
   runner-check     time small requests to the runner, to see whether it freezes on its own
+  runner-stress    sweep one parameter over OSC at a few rates and time how well the runner keeps up
 """
 
 from __future__ import annotations
@@ -1345,6 +1346,144 @@ def cmd_runner_check(cfg: dict, args) -> int:
     return 0
 
 
+def _stress_rate(client, p: Param, rate: float, seconds: float, replies: list, lock) -> dict:
+    """Sweep one parameter at `rate` changes per second; time the runner's reports."""
+    tol = max(1e-3, 0.5 / (p.steps - 1) + 1e-3) if p.steps and p.steps > 1 else 1e-3
+    with lock:
+        replies.clear()
+    sends = []
+    interval = 1.0 / rate
+    t_start = time.monotonic()
+    for i in range(max(1, int(seconds * rate))):
+        ph = (i * interval / 4.0) % 1.0  # a slow triangle between 0.2 and 0.8, 4 s per sweep
+        v = round(0.2 + 0.6 * (2 * ph if ph < 0.5 else 2 - 2 * ph), 5)
+        t = time.monotonic()
+        client.send_message(p.address, v)
+        sends.append((t, v))
+        time.sleep(max(0.0, t_start + (i + 1) * interval - time.monotonic()))
+    t_end = time.monotonic()
+    # wait for late reports: until the runner has been quiet for 1 s (at most 10 s)
+    while time.monotonic() - t_end < 10:
+        with lock:
+            last = replies[-1][0] if replies else t_end
+        if time.monotonic() - max(last, t_end) > 1.0:
+            break
+        time.sleep(0.1)
+    with lock:
+        got = list(replies)
+    lats, missing = [], 0
+    j = 0
+    for t, v in sends:
+        while j < len(got) and got[j][0] < t:
+            j += 1
+        r = next((r for r in got[j:] if abs(r[1] - v) <= tol), None)
+        if r is None:
+            missing += 1
+        else:
+            lats.append(r[0] - t)
+    # longest stretch with no report at all while changes were going out
+    inside = [t_start] + [r[0] for r in got if t_start <= r[0] <= t_end] + [t_end]
+    silence = max(b - a for a, b in zip(inside, inside[1:]))
+    lats.sort()
+    return {"rate": rate, "sent": len(sends), "answered": len(lats), "missing": missing,
+            "typical": lats[len(lats) // 2] if lats else None, "slowest": lats[-1] if lats else None,
+            "slow": sum(1 for x in lats if x > 0.2), "silence": silence}
+
+
+def cmd_runner_stress(cfg: dict, args) -> int:
+    """Sweep one parameter over OSC at a few rates, without the EC4 or the bridge, and report
+    how quickly the runner keeps up."""
+    from pythonosc.dispatcher import Dispatcher
+    from pythonosc.osc_server import BlockingOSCUDPServer
+    from pythonosc.udp_client import SimpleUDPClient
+    host = cfg["runner_host"]
+    try:
+        params = parse_params(fetch_graph(host, cfg["oscquery_port"]))
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"Could not reach the runner at {host}:{cfg['oscquery_port']}: {exc}")
+        return 1
+    p = next((x for x in params if args.param in (x.key, f"{x.inst}/{x.label}")), None) if args.param else None
+    if p is None:
+        if args.param:
+            print(f"No parameter '{args.param}'.")
+        print("Pick a parameter that's safe to sweep (it moves between 20% and 80% and is set back "
+              "afterwards), e.g.:  venv/bin/python ec4bridge.py runner-stress 1/mix\n")
+        for x in params[:40]:
+            print(f"  {x.key:<28} {x.label}  ({x.inst_name})")
+        if len(params) > 40:
+            print(f"  ... and {len(params) - 40} more")
+        return 1
+    if _service_pid() and not args.force:
+        print("Stop the bridge first, so only this test talks to the runner:\n"
+              "  sudo systemctl stop ec4bridge")
+        return 1
+    try:
+        rates = [float(r) for r in args.rates.split(",") if r.strip()]
+    except ValueError:
+        print("--rates must look like 10,30,60")
+        return 1
+
+    replies: list[tuple[float, float]] = []
+    lock = threading.Lock()
+
+    def on_osc(address, *a):
+        if address == p.address and a:
+            try:
+                v = float(a[0])
+            except (TypeError, ValueError):
+                return
+            with lock:
+                replies.append((time.monotonic(), v))
+
+    disp = Dispatcher()
+    disp.set_default_handler(on_osc)
+    port = int(args.listen_port or (int(cfg["listen_port"]) + 1))
+    server = BlockingOSCUDPServer(("0.0.0.0", port), disp)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    ip = cfg["listen_ip"] if cfg["listen_ip"] != "auto" else local_ip_for(host)
+    listener = f"{ip}:{port}"
+    client = SimpleUDPClient(host, int(cfg["osc_port"]))
+    client.send_message("/rnbo/listeners/add", listener)
+    time.sleep(0.5)
+    secs = float(args.seconds)
+    print(f"Sweeping {p.key} ({p.label}) on '{p.inst_name}' for {secs:.0f} s at each of "
+          f"{', '.join(f'{r:g}' for r in rates)} changes per second. It changes the sound and is set "
+          f"back afterwards. Don't touch anything meanwhile.\n")
+    results = []
+    try:
+        for rate in rates:
+            r = _stress_rate(client, p, rate, secs, replies, lock)
+            results.append(r)
+            ms = lambda x: "-" if x is None else f"{x * 1000:.0f} ms"  # noqa: E731
+            print(f"{rate:>5g}/s: sent {r['sent']}, reported back {r['answered']}; typical {ms(r['typical'])}, "
+                  f"slowest {ms(r['slowest'])}, {r['slow']} slower than 200 ms; longest silence "
+                  f"{ms(r['silence'])}", flush=True)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("stopped")
+    finally:
+        client.send_message(p.address, float(p.normalized))
+        client.send_message("/rnbo/listeners/del", listener)
+        server.server_close()
+    bad = [r for r in results if (r["slowest"] or 0) > 0.5 or r["silence"] > 0.5 or not r["answered"]]
+    print()
+    if not results:
+        return 1
+    if not bad:
+        print("The runner kept up at every rate. Without the bridge it doesn't freeze, so the freezes "
+              "need something else the bridge does at the same time; send me this output.")
+    elif bad[0] is not results[0]:
+        ok = results[results.index(bad[0]) - 1]["rate"]
+        print(f"The runner keeps up at {ok:g} changes per second but falls behind at "
+              f"{bad[0]['rate']:g}. Setting \"osc_send_interval_ms\" to {int(1000 / ok)} "
+              f"or more should stop the freezes.")
+    else:
+        print("The runner freezes even from this simple test, with no EC4 and no bridge involved: the "
+              "problem is in the runner (or the Pi). This output is a good reproduction to send to "
+              "Cycling '74.")
+    return 0
+
+
 def cmd_trace(cfg: dict, args) -> int:
     """Ask the running bridge to record a timeline, then print its summary."""
     import glob
@@ -1397,6 +1536,13 @@ def main(argv=None) -> int:
     sub.add_parser("trace", help="record what the running bridge does for a few seconds, and where it lags")
     p = sub.add_parser("runner-check", help="check whether the runner freezes on its own")
     p.add_argument("--seconds", type=float, default=60)
+    p = sub.add_parser("runner-stress", help="sweep one parameter over OSC (no EC4, no bridge) and "
+                                             "time how well the runner keeps up")
+    p.add_argument("param", nargs="?", help="parameter key, e.g. 1/mix (omit to list them)")
+    p.add_argument("--rates", default="10,30,60", help="changes per second to try (default 10,30,60)")
+    p.add_argument("--seconds", type=float, default=15, help="seconds per rate (default 15)")
+    p.add_argument("--listen-port", type=int, default=0)
+    p.add_argument("--force", action="store_true", help="run even if the bridge is running")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1406,6 +1552,7 @@ def main(argv=None) -> int:
         "run": cmd_run, "list": cmd_list, "capture-backup": cmd_capture_backup,
         "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display, "monitor": cmd_monitor,
         "trace": cmd_trace, "runner-check": cmd_runner_check,
+        "runner-stress": cmd_runner_stress,
     }[args.cmd](cfg, args)
 
 
