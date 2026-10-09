@@ -214,6 +214,13 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
      `send-layout`. For finer control use `"resolution": "14bit"` (plus `send-layout`).
   3. Make sure `feedback_holdoff_ms` is at least 1000 (older example configs had 250).
   4. Close the RNBO web interface in your browser while playing; it adds load on the Pi.
+  5. Record a trace while the problem happens: run `venv/bin/python ec4bridge.py trace` (with the
+     service running) and turn knobs for 20 seconds. It times every stage of each turn separately:
+     the EC4 sending, the bridge passing it on, the runner applying it. The summary then says
+     which stage stalls, and whether something other than the bridge is also changing the
+     parameters. The full timeline is saved as `trace-<date>.txt` in this folder. Without the
+     command: `sudo systemctl kill -s USR1 ec4bridge`, then `journalctl -u ec4bridge -n 30`.
+     `trace_seconds` (default 20) sets the length.
 
 - **"Receive error" on the EC4 during `send-layout`**: something else reached the EC4 in the middle
   of the dump. `send-layout` and `capture-backup` pause a running bridge service automatically

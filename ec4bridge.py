@@ -14,6 +14,7 @@ Subcommands:
   send-layout      make the dump and send it to the EC4 (EC4 must be in Receive)
   test-display     check that the EC4 accepts live display text (firmware 2.0+)
   monitor          show what the EC4 sends as you turn encoders (timing, skipped steps)
+  trace            record what the running bridge does for a few seconds, and where it lags
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import ec4_remote
 import ec4_sysex
 from layout import Layout, Slot, build_layout, format_table
 from oscpacer import OscPacer
+from ec4trace import Trace, analyze, format_events
 from rnbo import Param, fetch_graph, graph_signature, instance_names, parse_params
 
 log = logging.getLogger("ec4bridge")
@@ -88,6 +90,7 @@ DEFAULTS = {
     "device_list_seconds": 8,
     "device_list_mode": "momentary",
     "device_list_page_seconds": 2,
+    "trace_seconds": 20,
 }
 
 
@@ -221,6 +224,7 @@ class Bridge:
         self._overlay_owner = None
         self._overlay_lines: list[str] = [""] * 4
         self._was_paused = False
+        self.trace = Trace()  # timeline for diagnosing lag (see ec4trace.py)
 
     # ---- layout ------------------------------------------------------------
     def update_from_params(self, params: list[Param]) -> bool:
@@ -292,6 +296,7 @@ class Bridge:
         return self.cur_setup is None or self.cur_setup == self.my_setup
 
     def on_sysex(self, msg: bytes):
+        self.trace.add("from_ec4_sysex", msg)
         rep = ec4_remote.parse_report(msg)
         if not rep:
             return
@@ -626,11 +631,18 @@ class Bridge:
 
     # ---- EC4 -> runner -----------------------------------------------------
     def on_cc(self, channel: int, cc: int, value: int):
-        if not self.on_my_setup() or self.paused():
+        tr = self.trace
+        tr.add("in", channel, cc, value)
+        if not self.on_my_setup():
+            tr.add("skip", "EC4 on another setup", channel, cc, value)
+            return
+        if self.paused():
+            tr.add("skip", "paused for a setup dump", channel, cc, value)
             return
         sent = self._sent_cc.get((channel, cc))
         if sent and sent[0] == value and time.monotonic() - sent[1] < 0.3:
-            return  # the EC4 echoing a value we just sent it, not a knob turn  # the EC4 is on one of your other setups
+            tr.add("skip", "same as a value just sent to the EC4", channel, cc, value)
+            return  # the EC4 echoing a value we just sent it, not a knob turn
         if self.hi_res:
             if self.cc_base <= cc < self.cc_base + 16:
                 self.msb[(channel, cc)] = value
@@ -660,6 +672,7 @@ class Bridge:
             self.values[k] = norm
             self.touched[k] = self._last_turn = time.monotonic()
             addr = slot.param.address
+        self.trace.add("set", k, addr, norm)
         hold = getattr(self.midi, "hold_display", None) if self.midi is not None else None
         if hold:  # nothing is drawn on the EC4 until the knob has rested this long
             hold(float(self.cfg.get("display_quiet_ms", 400)) / 1000.0)
@@ -672,6 +685,7 @@ class Bridge:
     # ---- runner -> EC4 -----------------------------------------------------
     def _osc_out(self, address: str, value: float):
         self._sent_at[address] = (time.monotonic(), value)
+        self.trace.add("osc_out", address, value)
         self.osc_stats["sent"] += 1
         self.osc_send(address, value)
 
@@ -695,6 +709,7 @@ class Bridge:
             v = float(args[0])
         except (TypeError, ValueError):
             return
+        self.trace.add("osc_in", address, v)
         sent = self._sent_at.get(address)
         if sent and abs(sent[1] - v) < 1e-3:  # the runner reporting back a change we sent
             lat = time.monotonic() - sent[0]
@@ -728,6 +743,7 @@ class Bridge:
         if self.midi is None or not self.on_my_setup() or self.paused():
             return
         msgs = self._cc_messages(slot, v)
+        self.trace.add("feedback", slot.param.key, msgs)
         now = time.monotonic()
         for ch, cc, val in msgs:
             self._sent_cc[(ch, cc)] = (val, now)
@@ -781,6 +797,61 @@ def open_midi(cfg: dict, **kw):
                          "Is this running on the Pi, and is the user in the 'audio' group?")
 
 
+# ---- lag trace (see ec4trace.py) -----------------------------------------------
+
+TRACE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def start_trace(bridge: Bridge, seconds: float):
+    if bridge.trace.active:
+        return
+    bridge.trace.start(seconds)
+    log.info("trace started for %.0f s: turn knobs the way that shows the problem", seconds)
+    t = threading.Timer(seconds + 0.3, finish_trace, args=(bridge,))
+    t.daemon = True
+    t.start()
+
+
+def finish_trace(bridge: Bridge) -> str | None:
+    events = bridge.trace.take()
+    with bridge.lock:
+        params = {s.param.address: (f"{s.param.key} ({s.param.label})", s.param.steps)
+                  for s in bridge.layout.slots}
+    summary = analyze(events, params)
+    path = os.path.join(TRACE_DIR, time.strftime("trace-%Y%m%d-%H%M%S.txt"))
+    try:
+        with open(path, "w") as f:
+            f.write("SUMMARY\n" + "\n".join(summary) + "\n\nTIMELINE (seconds from the first event)\n"
+                    + format_events(events, params) + "\n")
+    except OSError as exc:
+        log.warning("could not write %s: %s", path, exc)
+        path = None
+    log.info("trace finished:")
+    for line in summary:
+        log.info("  %s", line)
+    if path:
+        log.info("full timeline: %s", path)
+    return path
+
+
+def _install_trace_hooks(bridge: Bridge, midi):
+    """Record every message written to the EC4 (only while a trace is running)."""
+    q = getattr(midi, "_queue", None)
+    if q is None:
+        return
+    write_cc, write_sysex = q._write_cc, q._write_sysex
+
+    def traced_cc(ch, cc, v):
+        bridge.trace.add("to_ec4_cc", ch, cc, v)
+        write_cc(ch, cc, v)
+
+    def traced_sysex(data):
+        bridge.trace.add("to_ec4_sysex", bytes(data))
+        write_sysex(data)
+
+    q._write_cc, q._write_sysex = traced_cc, traced_sysex
+
+
 # ---- subcommands -------------------------------------------------------------
 
 def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
@@ -792,6 +863,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
     bridge = Bridge(cfg, osc_send=lambda a, v: client.send_message(a, v))
     midi = open_midi(cfg, on_cc=bridge.on_cc, on_sysex=bridge.on_sysex)
     bridge.midi = midi
+    _install_trace_hooks(bridge, midi)
 
     disp = Dispatcher()
     disp.set_default_handler(bridge.on_osc)
@@ -805,6 +877,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGUSR1, lambda *_: start_trace(bridge, float(cfg["trace_seconds"])))
 
     runner_ok = False
     need_full = True  # read the whole graph (expensive for the runner) only when it changed
@@ -819,7 +892,9 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
     while not stop.is_set():
         reconnected = False
         try:
+            t_scan = time.monotonic()
             reconnected = midi.ensure_connected()
+            bridge.trace.add("port_scan", "MIDI port scan", time.monotonic() - t_scan)
             if reconnected:
                 bridge.cur_setup = bridge.cur_group = None
                 bridge.request_ec4_state()  # the EC4 answers with its setup and group
@@ -828,7 +903,10 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         try:
             host, port = cfg["runner_host"], cfg["oscquery_port"]
             if not need_full and signature is not None:
-                if graph_signature(host, port, known) != signature:
+                t_probe = time.monotonic()
+                sig_now = graph_signature(host, port, known)
+                bridge.trace.add("http", "graph check", time.monotonic() - t_probe)
+                if sig_now != signature:
                     log.info("graph changed; reading it from the runner")
                     need_full = True
             full_every = float(cfg["full_refresh_interval"] or 0)
@@ -838,6 +916,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
             if need_full:
                 t_poll = time.monotonic()
                 tree = fetch_graph(host, port, known)
+                bridge.trace.add("http", "graph read", time.monotonic() - t_poll)
                 params = parse_params(tree)
                 known = instance_names(tree)
                 signature = graph_signature(host, port, known)
@@ -1197,6 +1276,56 @@ def cmd_test_display(cfg: dict, args) -> int:
     return 0
 
 
+def _service_pid() -> int | None:
+    import subprocess
+    try:
+        r = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", "ec4bridge"],
+                           capture_output=True, text=True, timeout=5)
+        pid = int(r.stdout.strip() or 0)
+        if pid:
+            return pid
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        r = subprocess.run(["pgrep", "-f", r"ec4bridge\.py.* run$"], capture_output=True, text=True, timeout=5)
+        pids = [int(x) for x in r.stdout.split() if int(x) != os.getpid()]
+        return pids[0] if pids else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def cmd_trace(cfg: dict, args) -> int:
+    """Ask the running bridge to record a timeline, then print its summary."""
+    import glob
+    pid = _service_pid()
+    if not pid:
+        print("The bridge isn't running. Start it with:  sudo systemctl start ec4bridge")
+        return 1
+    started = time.time()
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except PermissionError:
+        print("No permission to signal the bridge. Run instead:  sudo systemctl kill -s USR1 ec4bridge")
+        return 1
+    secs = float(cfg["trace_seconds"])
+    print(f"Recording for {secs:.0f} s. Turn knobs now, the way that shows the problem...")
+    deadline = started + secs + 15
+    while time.time() < deadline:
+        files = [f for f in glob.glob(os.path.join(TRACE_DIR, "trace-*.txt"))
+                 if os.path.getmtime(f) >= started - 1]
+        if files:
+            path = max(files, key=os.path.getmtime)
+            with open(path) as f:
+                text = f.read()
+            print()
+            print(text.split("\n\nTIMELINE")[0])
+            print(f"\nFull timeline: {path}")
+            return 0
+        time.sleep(0.5)
+    print("No trace appeared. Is the bridge up to date? Check:  journalctl -u ec4bridge -n 30")
+    return 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-c", "--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
@@ -1214,6 +1343,7 @@ def main(argv=None) -> int:
     p.add_argument("--timeout", type=float, default=120)
     sub.add_parser("test-display", help="check live display text on the EC4")
     sub.add_parser("monitor", help="show what the EC4 sends, with timing")
+    sub.add_parser("trace", help="record what the running bridge does for a few seconds, and where it lags")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1222,6 +1352,7 @@ def main(argv=None) -> int:
     return {
         "run": cmd_run, "list": cmd_list, "capture-backup": cmd_capture_backup,
         "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display, "monitor": cmd_monitor,
+        "trace": cmd_trace,
     }[args.cmd](cfg, args)
 
 

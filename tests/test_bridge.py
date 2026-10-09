@@ -1308,5 +1308,92 @@ class CliTests(unittest.TestCase):
             self.assertIn("Could not reach", r.stdout)
 
 
+class TraceTests(unittest.TestCase):
+    MIX = "/rnbo/inst/1/params/mix/normalized"
+
+    def synthetic(self, gap=0.01, jump=1, reply=0.002, foreign=False):
+        """One knob turned 20 steps; optionally a stall, slow replies or a value from elsewhere."""
+        ev, t, v = [], 100.0, 40
+        for i in range(20):
+            step = jump if i == 10 else 1
+            t += gap if i == 10 else 0.01
+            v += step
+            n = v / 127
+            ev.append((t, "set", "1/mix", self.MIX, n))
+            ev.append((t + 0.0005, "osc_out", self.MIX, n))
+            ev.append((t + 0.0005 + reply, "osc_in", self.MIX, n))
+        if foreign:
+            ev.append((t + 0.005, "osc_in", self.MIX, 0.9))
+        ev.sort()
+        return ev
+
+    def test_smooth_turn(self):
+        from ec4trace import analyze
+        text = "\n".join(analyze(self.synthetic()))
+        self.assertIn("EC4 -> bridge: smooth", text)
+        self.assertIn("slowest 2 ms", text)
+        self.assertNotIn("never sent", text)
+
+    def test_stall_found(self):
+        from ec4trace import analyze
+        ev = self.synthetic(gap=0.3, jump=12)
+        ev.append((ev[0][0] + 0.12, "to_ec4_sysex", b"\xf0\xf7"))
+        ev.sort()
+        text = "\n".join(analyze(ev, {self.MIX: ("1/mix (mix)", 0)}))
+        self.assertIn("1 stall(s)", text)
+        self.assertIn("silent for 300 ms, jumped 12 steps", text)
+        self.assertIn("to_ec4_sysex x1", text)
+
+    def test_slow_runner_and_foreign_values(self):
+        from ec4trace import analyze
+        text = "\n".join(analyze(self.synthetic(reply=0.4, foreign=True), {self.MIX: ("1/mix (mix)", 0)}))
+        self.assertIn("slowest 400 ms", text)
+        self.assertIn("1/mix (mix) took 400 ms", text)
+        self.assertIn("1 value(s) reported by the runner that the bridge never sent", text)
+
+    def test_stepped_parameter_rounding_is_not_foreign(self):
+        from ec4trace import analyze
+        ev = [(1.0, "set", "1/m", self.MIX, 0.30), (1.001, "osc_out", self.MIX, 0.30),
+              (1.002, "osc_in", self.MIX, 1 / 3)]
+        text = "\n".join(analyze(ev, {self.MIX: ("m", 4)}))
+        self.assertNotIn("never sent", text)
+        self.assertIn("0 of 1 never reported back", text)
+
+    def test_trace_on_bridge_writes_file(self):
+        import ec4bridge
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(layout_txt=os.path.join(d, "l.txt"), backup_syx=os.path.join(d, "none.syx"),
+                    value_popup=False)
+            osc = []
+            b = Bridge(c, midi=FakeMidi(), osc_send=lambda a, v: osc.append((a, v)))
+            b.update_from_params(parse_params(default_tree()))
+            old = ec4bridge.TRACE_DIR
+            ec4bridge.TRACE_DIR = d
+            try:
+                b.trace.start(5)
+                for v in range(60, 70):
+                    b.on_cc(2, 18, v)  # group 3 encoder 3: delay mix
+                    time.sleep(0.02)
+                    b.on_osc(self.MIX, v / 127)
+                b.on_cc(9, 99, 1)  # unmapped: recorded, not a parameter change
+                path = ec4bridge.finish_trace(b)
+            finally:
+                ec4bridge.TRACE_DIR = old
+                b._pacer.close()
+            self.assertFalse(b.trace.active)
+            with open(path) as f:
+                text = f.read()
+            self.assertIn("11 knob messages from the EC4, 10 parameter changes, 10 sent to the runner", text)
+            self.assertIn("EC4 -> bridge: smooth", text)
+            self.assertIn("TIMELINE", text)
+            self.assertIn("osc_out", text)
+            self.assertIn("1/mix", text)
+
+    def test_no_recording_when_idle(self):
+        b = Bridge(cfg(), midi=FakeMidi())
+        b.on_cc(0, 16, 1)
+        self.assertEqual(b.trace.events, [])
+
+
 if __name__ == "__main__":
     unittest.main()

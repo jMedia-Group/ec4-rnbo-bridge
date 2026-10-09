@@ -47,6 +47,7 @@
   "display_quiet_ms": 400,
   "osc_send_interval_ms": 15,
   "units": { "0/cutoff": "Hz" },
+  "trace_seconds": 20,
 
   "backup_syx": "ec4-backup.syx",
   "layout_syx": "ec4-layout.syx",
