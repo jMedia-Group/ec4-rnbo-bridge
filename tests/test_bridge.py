@@ -162,6 +162,30 @@ class SysexTests(unittest.TestCase):
             sx.apply_layout(d, 0, "R", [], names, cc_base=20, resolution="14bit", mode="Acc3")
 
 
+class GraphSignatureTests(unittest.TestCase):
+    def test_signature_changes_only_with_the_graph(self):
+        from rnbo import graph_signature, instance_names
+        runner = MockRunner()
+        try:
+            known = instance_names(runner.tree)
+            self.assertEqual(known, {0: "polysynth", 1: "pingpong"})
+            sig = graph_signature("127.0.0.1", runner.port, known)
+            self.assertEqual(sig[0], "my set")
+            # a parameter value changing doesn't change the signature
+            runner.tree["CONTENTS"]["1"]["CONTENTS"]["params"]["CONTENTS"]["mix"]["VALUE"] = [0.9]
+            self.assertEqual(graph_signature("127.0.0.1", runner.port, known), sig)
+            # a new device does
+            from mock_runner import make_instance
+            runner.tree["CONTENTS"]["2"] = make_instance(2, "reverb", [("size", 0, 0.5)])
+            self.assertNotEqual(graph_signature("127.0.0.1", runner.port, known), sig)
+            del runner.tree["CONTENTS"]["2"]
+            # a different set does
+            runner.tree["CONTENTS"]["control"]["CONTENTS"]["sets"]["CONTENTS"]["current"]["CONTENTS"]["name"]["VALUE"] = ["other"]
+            self.assertNotEqual(graph_signature("127.0.0.1", runner.port, known), sig)
+        finally:
+            runner.close()
+
+
 class LayoutTests(unittest.TestCase):
     def setUp(self):
         self.params = parse_params(default_tree())
@@ -500,6 +524,11 @@ class RunLoopTest(unittest.TestCase):
                         break
                     time.sleep(0.02)
                 self.assertEqual(fake.sent, [(2, 16, 0)])
+                # the whole graph was read once; after that only cheap checks
+                time.sleep(0.5)
+                self.assertEqual(runner.requests.count("/rnbo/inst"), 1)
+                self.assertIn("/rnbo/inst/control/sets/current/name", runner.requests)
+                self.assertIn("/rnbo/inst/1/name", runner.requests)
                 # load a different patcher -> layout rebuilt and written
                 runner.tree["CONTENTS"].pop("1")
                 for _ in range(50):
@@ -521,6 +550,7 @@ class RunLoopTest(unittest.TestCase):
                 osc_in.server_close()
                 runner.close()
         self.assertFalse(t.is_alive())
+        self.assertEqual(runner.requests.count("/rnbo/inst"), 2)  # start-up + after the change
         self.assertIn(("/rnbo/listeners/del", (f"127.0.0.1:{listen_port}",)), got)
 
 

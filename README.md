@@ -195,7 +195,8 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |
 | `feedback_holdoff_ms` | 1000 | after you turn an encoder, ignore the runner's reports for it this long, so a late report can't snap the knob back |
-| `poll_interval` | 2.0 | seconds between OSCQuery scans (patch changes, missed values) |
+| `poll_interval` | 2.0 | seconds between quick checks for a graph change (set name and device names only; cheap for the runner) |
+| `full_refresh_interval` | 0 | also re-read the whole graph every N seconds (0 = only when it changed). Reading a big graph can keep the runner busy for seconds, which makes the sound stutter |
 
 **14-bit mode** uses the EC4's 14-bit CC type (CC 16–31 plus LSB on CC 48–63) for smooth
 filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, or a

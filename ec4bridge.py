@@ -34,7 +34,7 @@ import urllib.error
 import ec4_remote
 import ec4_sysex
 from layout import Layout, Slot, build_layout, format_table
-from rnbo import Param, fetch_tree, parse_params
+from rnbo import Param, fetch_tree, graph_signature, instance_names, parse_params
 
 log = logging.getLogger("ec4bridge")
 
@@ -52,6 +52,7 @@ DEFAULTS = {
     "display": "",
     "cc_base": 16,
     "poll_interval": 2.0,
+    "full_refresh_interval": 0,
     "feedback_holdoff_ms": 1000,
     "new_group_per_instance": True,
     "include": [],
@@ -782,6 +783,10 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     runner_ok = False
+    need_full = True  # read the whole graph (expensive for the runner) only when it changed
+    signature = None
+    known: dict[int, str] = {}
+    last_full = 0.0
     last_refresh = time.monotonic()
     last_stats = time.monotonic()
     slow_logged = 0.0
@@ -797,18 +802,33 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         except Exception as exc:
             log.warning("MIDI port scan failed: %s", exc)
         try:
-            t_poll = time.monotonic()
-            params = fetch_params(cfg)
-            took = time.monotonic() - t_poll
-            if took > 0.25 and time.monotonic() - slow_logged > 60:
-                slow_logged = time.monotonic()
-                log.info("reading the graph from the runner took %d ms (%d parameters); a larger "
-                         "poll_interval makes this happen less often", took * 1000, len(params))
+            host, port = cfg["runner_host"], cfg["oscquery_port"]
+            if not need_full and signature is not None:
+                if graph_signature(host, port, known) != signature:
+                    log.info("graph changed; reading it from the runner")
+                    need_full = True
+            full_every = float(cfg["full_refresh_interval"] or 0)
+            if full_every and time.monotonic() - last_full >= full_every:
+                need_full = True
+            params = None
+            if need_full:
+                t_poll = time.monotonic()
+                tree = fetch_tree(host, port)
+                params = parse_params(tree)
+                known = instance_names(tree)
+                signature = graph_signature(host, port, known)
+                need_full = False
+                last_full = time.monotonic()
+                took = last_full - t_poll
+                if took > 0.25 and time.monotonic() - slow_logged > 60:
+                    slow_logged = time.monotonic()
+                    log.info("reading the graph from the runner took %d ms (%d parameters); this "
+                             "now only happens when the graph changes", took * 1000, len(params))
             if not runner_ok:
                 log.info("runner reachable; registering OSC listener %s", listener)
                 client.send_message("/rnbo/listeners/add", listener)
                 runner_ok = True
-            changed = bridge.update_from_params(params)
+            changed = bridge.update_from_params(params) if params is not None else False
             if reconnected and not changed:
                 bridge.resync()
                 bridge.write_names()
@@ -843,6 +863,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
             if runner_ok:
                 log.warning("runner not reachable: %s", exc)
             runner_ok = False
+            need_full = True
         stop.wait(float(cfg["poll_interval"]))
 
     log.info("stopping")

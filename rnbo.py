@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
@@ -56,6 +57,35 @@ def fetch_tree(host: str, port: int, path: str = "/rnbo/inst", timeout: float = 
     url = f"http://{host}:{port}{path}"
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+SET_NAME_PATH = "/rnbo/inst/control/sets/current/name"
+
+
+def instance_names(tree: dict) -> dict[int, str]:
+    """{instance index: patcher name} for every instance in a /rnbo/inst tree."""
+    insts = tree.get("CONTENTS") or {}
+    return {int(k): str(_value(_child(insts[k], "name"), "") or "") for k in insts if k.isdigit()}
+
+
+def fetch_value(host: str, port: int, path: str, timeout: float = 1.0):
+    """Value of one small node, or None if it doesn't exist."""
+    try:
+        return _value(fetch_tree(host, port, path, timeout))
+    except urllib.error.HTTPError as exc:
+        if 400 <= exc.code < 500:  # no such node (servers differ in the exact code)
+            return None
+        raise
+
+
+def graph_signature(host: str, port: int, known: dict[int, str]) -> tuple:
+    """Cheap fingerprint of what's loaded: the current set's name and the patcher name of each
+    known instance plus the next two indexes. A handful of tiny requests, instead of the whole
+    tree (which can take the runner seconds to produce with a big graph)."""
+    top = max(known, default=-1)
+    indexes = sorted(set(known) | {top + 1, top + 2})
+    names = tuple((i, fetch_value(host, port, f"/rnbo/inst/{i}/name")) for i in indexes)
+    return (fetch_value(host, port, SET_NAME_PATH), names)
 
 
 def _value(node: dict | None, default=None):
