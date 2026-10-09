@@ -19,8 +19,11 @@ EC4 setup   ◀── SysEx setup dump (once: `send-layout`)
 - Encoder *e* in group *g* sends **CC (16 + e − 1) on MIDI channel g**. The scheme never
   changes, so encoders keep working after you load a different patcher, even before the names
   are updated.
-- Names are shortened to the EC4's 4 characters (`cutoff` → `cutf`, `resonance` → `resn`,
-  `osc2Level` → `os2L`), keeping the capitalization they have in RNBO.
+- Names are shortened to the EC4's 4 characters, keeping the capitalization they have in RNBO.
+  One word: its first letters without most vowels (`cutoff` → `cutf`, `resonance` → `resn`).
+  Several words (spaces, camelCase or under_scores): the first word's letters plus a capital
+  initial for each following word (`foo bar` / `fooBar` → `fooB`, `filterEnvAmount` → `fiEA`,
+  `osc2Level` → `os2L`).
   Group names come from the instance name (`pol1`, `pol2` when an instance
   spans two groups). You can override any of them in `config.json`.
 
@@ -99,6 +102,18 @@ on** (or after updating from a version without live names).
 
 The names page shows names; if you've pressed BAR or NUM to show values, press NAME to go back.
 
+**While you turn an encoder**, a pop-up shows what the 4-letter name can't:
+
+```
+Filter Cutoff
+1240
+##########.....  67%
+polysynth
+```
+
+The value is RNBO's real value, as reported back by the runner (enums show their label). It
+disappears 1.5 s after you stop turning (`value_popup`, `value_popup_seconds`).
+
 To check, run `venv/bin/python ec4bridge.py test-display` with the EC4 on the RNBO setup. It asks
 the EC4 which setup it's on, shows a test message for 4 seconds, then writes `T01`…`T16` as encoder
 names for 4 seconds. If the test names don't appear, the stored names aren't `----` yet: run
@@ -167,6 +182,8 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `device_list_page_seconds` | 2 | momentary mode: how fast pages flip while held (more than 8 groups) |
 | `device_list_seconds` | 8 | toggle mode: how long the list stays up; momentary mode: safety timeout |
 | `notify_group_change` | `true` | pop up the instance name when you switch groups |
+| `value_popup` | `true` | while you turn an encoder, show its full name, value, a level bar and the device |
+| `value_popup_seconds` | 1.5 | how long that stays after you stop turning |
 | `zero_unused` | `true` | set every encoder without a parameter to 0 (on a new graph, at start-up and when you return to the RNBO setup), so no values are left over from the previous graph |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |

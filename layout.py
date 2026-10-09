@@ -51,29 +51,34 @@ def abbreviate(name: str, n: int = 4, case: str = "keep") -> str:
     return apply_case(_abbreviate(name, n, case), case)
 
 
+def _first_plus_initials(words: list[str], n: int, case: str) -> str:
+    """First word's first letters + a capital initial per following word.
+
+    'foo bar' / 'fooBar' -> 'fooB', 'filter env amount' / 'filterEnvAmount' -> 'fiEA',
+    'osc 2 level' / 'osc2Level' -> 'os2L'.
+    """
+    tail = words[1:n]  # at most n-1 initials, so the first word keeps at least one letter
+    room = n - len(tail)
+    first = words[0] if len(words[0]) <= room else _squeeze(words[0], room)
+    out = _cap(first[:room], case) + "".join(w[0].upper() for w in tail)
+    if len(out) < n:  # short first word ('j.reverb' -> 'jR'): fill up from the last word -> 'jRev'
+        out += tail[-1][1:1 + n - len(out)]
+    return out
+
+
 def _abbreviate(name: str, n: int, case: str) -> str:
-    words = _words(name)
+    if re.search(r"\S\s+\S", name.strip()):
+        # words separated by spaces (each kept whole, e.g. 'filterEnv amount' -> 'filA')
+        words = [re.sub(r"[^0-9A-Za-z]", "", w) for w in name.split()]
+        words = [w for w in words if w]
+    else:
+        # camelCase, under_scores, digits: 'fooBar' -> ['foo', 'Bar']
+        words = _words(name)
     if not words:
         return (re.sub(r"[^0-9A-Za-z./-]", "", name) or "?")[:n]
     if len(words) == 1:
         return _cap(_squeeze(words[0], n), case)
-    if len(words) >= n:
-        return "".join(_cap(w[0], case) for w in words[:n])
-    # share n chars across the words, earlier words get the remainder
-    k = len(words)
-    sizes = [n // k + (1 if i < n % k else 0) for i in range(k)]
-    # give unused room from short words (e.g. digits '2') to the first word
-    parts = []
-    spare = 0
-    for w, size in zip(words, sizes):
-        if len(w) < size:
-            spare += size - len(w)
-    for i, (w, size) in enumerate(zip(words, sizes)):
-        if i == 0:
-            size += spare
-        p = w if w.isdigit() else _squeeze(w, size)
-        parts.append(_cap(p[:size], case))
-    return "".join(parts)[:n]
+    return _first_plus_initials(words, n, case)
 
 
 def _dedupe(names: list[str | None]) -> list[str | None]:

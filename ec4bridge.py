@@ -69,6 +69,8 @@ DEFAULTS = {
     "live_names": True,
     "live_names_refresh": 0,
     "zero_unused": True,
+    "value_popup": True,
+    "value_popup_seconds": 1.5,
     "notify_graph_change": True,
     "notify_seconds": 2.5,
     "notify_group_change": True,
@@ -189,6 +191,11 @@ class Bridge:
         self._list_until = 0.0
         self._list_held = False
         self._rotate_timer: threading.Timer | None = None
+        self.by_raw: dict[str, Slot] = {}
+        self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
+        self._popup_pending: tuple[Slot, object] | None = None
+        self._popup_last = 0.0
+        self._popup_timer: threading.Timer | None = None
         self._was_paused = False
 
     # ---- layout ------------------------------------------------------------
@@ -203,13 +210,17 @@ class Bridge:
                 self.layout = layout
                 self.by_cc = {(s.group, self.cc_base + s.encoder): s for s in layout.slots}
                 self.by_addr = {s.param.address: s for s in layout.slots}
+                self.by_raw = {s.param.raw_address: s for s in layout.slots}
                 self.values = {s.param.key: s.param.normalized for s in layout.slots}
+                self.raw = {s.param.key: s.param.value for s in layout.slots}
                 self.msb.clear()
             else:
                 # catch value changes the OSC listener might have missed
                 now = time.monotonic()
                 for s in layout.slots:
                     k = s.param.key
+                    if s.param.value is not None and now - self.touched.get(k, 0) >= 1.0:
+                        self.raw[k] = s.param.value
                     old = self.values.get(k)
                     if old is None or abs(old - s.param.normalized) < 1e-6:
                         continue
@@ -366,6 +377,62 @@ class Bridge:
             self._overlay_timer.cancel()
         self._overlay_timeout()
 
+    # ---- value pop-up while turning an encoder ---------------------------------
+    @staticmethod
+    def format_value(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        av = abs(v)
+        if v.is_integer() and av < 1e6:
+            return str(int(v))
+        if av >= 1000:
+            return f"{v:.0f}"
+        if av >= 100:
+            return f"{v:.1f}"
+        if av >= 10:
+            return f"{v:.2f}"
+        return f"{v:.3f}"
+
+    def value_popup_lines(self, slot: Slot, raw) -> list[str]:
+        from layout import strip_prefixes
+        p = slot.param
+        norm = min(1.0, max(0.0, self.values.get(p.key, p.normalized)))
+        if raw is None:
+            raw = self.raw.get(p.key)
+        filled = round(norm * 15)
+        bar = "#" * filled + "." * (15 - filled) + f"{round(norm * 100):>4}%"
+        device = strip_prefixes(p.inst_name, self.cfg.get("strip_prefixes") or [])
+        return [p.label[:20], self.format_value(raw)[:20], bar, device[:20]]
+
+    def value_popup(self, slot: Slot, raw):
+        """Full parameter name, value, bar and device on the overlay (throttled to ~20/s)."""
+        if not self.cfg.get("value_popup", True) or self._list_held:
+            return
+        if not self.on_my_setup() or self.paused() or self.midi is None:
+            return
+        self._popup_pending = (slot, raw)
+        wait = 0.05 - (time.monotonic() - self._popup_last)
+        if wait <= 0:
+            self._flush_popup()
+        elif not (self._popup_timer and self._popup_timer.is_alive()):
+            self._popup_timer = threading.Timer(wait, self._flush_popup)
+            self._popup_timer.daemon = True
+            self._popup_timer.start()
+
+    def _flush_popup(self):
+        pending, self._popup_pending = self._popup_pending, None
+        if pending is None or self._list_held:
+            return
+        self._popup_last = time.monotonic()
+        slot, raw = pending
+        self.notify(self.value_popup_lines(slot, raw), seconds=float(self.cfg["value_popup_seconds"]))
+
     # ---- device list (SHIFT + push encoder 16 by default) ----------------------
     def _is_list_key(self, rep: dict) -> bool:
         key = parse_list_key(self.cfg.get("device_list_key", ""))
@@ -485,10 +552,22 @@ class Bridge:
             addr = slot.param.address
         if self.osc_send:
             self.osc_send(addr, float(norm))
+        # show the name and value right away (a linear estimate); the runner's exact value
+        # replaces it as soon as it comes back over OSC
+        self.value_popup(slot, slot.param.approx_value(norm))
 
     # ---- runner -> EC4 -----------------------------------------------------
     def on_osc(self, address: str, *args):
-        if not args or not address.endswith("/normalized"):
+        if not args:
+            return
+        raw_slot = self.by_raw.get(address)
+        if raw_slot is not None:
+            k = raw_slot.param.key
+            self.raw[k] = args[0]
+            if time.monotonic() - self.touched.get(k, 0) < self.cfg["value_popup_seconds"]:
+                self.value_popup(raw_slot, args[0])  # exact value for the encoder being turned
+            return
+        if not address.endswith("/normalized"):
             return
         try:
             v = float(args[0])

@@ -19,6 +19,9 @@ class Param:
     enum_values: list[str] | None
     normalized: float
     address: str         # OSC address of the normalized value
+    value: float | str | None = None  # current raw value (enum: its label)
+    min: float | None = None
+    max: float | None = None
 
     @property
     def key(self) -> str:
@@ -27,6 +30,25 @@ class Param:
     @property
     def label(self) -> str:
         return self.display_name or self.pid.split("/")[-1]
+
+    @property
+    def raw_address(self) -> str:
+        """OSC address of the raw (unnormalized) value."""
+        return self.address[: -len("/normalized")] if self.address.endswith("/normalized") else self.address
+
+    def approx_value(self, normalized: float):
+        """Raw value for a normalized one, until the runner reports the exact value
+        (linear guess; RNBO parameters can have a non-linear curve)."""
+        if self.enum_values:
+            n = len(self.enum_values)
+            return self.enum_values[min(n - 1, max(0, round(normalized * (n - 1))))]
+        if self.min is None or self.max is None:
+            return None
+        v = self.min + normalized * (self.max - self.min)
+        if self.steps and self.steps > 1:
+            step = (self.max - self.min) / (self.steps - 1)
+            v = self.min + round((v - self.min) / step) * step
+        return v
 
 
 def fetch_tree(host: str, port: int, path: str = "/rnbo/inst", timeout: float = 2.0) -> dict:
@@ -77,6 +99,13 @@ def parse_params(tree: dict) -> list[Param]:
                     if rng and isinstance(rng[0], dict) and "VALS" in rng[0]:
                         enum_vals = [str(v) for v in rng[0]["VALS"]]
                     order = _value(_child(cnode, "display_order"))
+                    lo = hi = None
+                    if rng and isinstance(rng[0], dict) and "MIN" in rng[0] and "MAX" in rng[0]:
+                        try:
+                            lo, hi = float(rng[0]["MIN"]), float(rng[0]["MAX"])
+                        except (TypeError, ValueError):
+                            lo = hi = None
+                    raw = _value(cnode)
                     found.append(Param(
                         inst=int(key),
                         inst_name=str(name),
@@ -88,6 +117,9 @@ def parse_params(tree: dict) -> list[Param]:
                         enum_values=enum_vals,
                         normalized=float(_value(norm, 0.0) or 0.0),
                         address=norm.get("FULL_PATH") or f"/rnbo/inst/{key}/params/{'/'.join(path)}/normalized",
+                        value=raw if isinstance(raw, (int, float, str)) else None,
+                        min=lo,
+                        max=hi,
                     ))
                 elif cnode.get("CONTENTS"):
                     walk(cnode, path)  # subpatcher folder

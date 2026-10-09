@@ -206,7 +206,7 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(lay.group_names[0], "revr")
         self.assertEqual([s.short for s in lay.slots], ["size", "decy"])
         lay = build_layout(parse_params(tree), cfg())
-        self.assertEqual(lay.group_names[0], "jre")  # without the option
+        self.assertEqual(lay.group_names[0], "jRev")  # without the option
 
     def test_group_title_style(self):
         lay = build_layout(self.params, cfg(group_title_style="number", group_names={"0": "Syn"}))
@@ -261,7 +261,26 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(abbreviate("LFO"), "LFO")
         self.assertEqual(abbreviate("mix"), "mix")
         self.assertEqual(abbreviate("Filter Env Amount"), "FiEA")
-        self.assertEqual(abbreviate("filter env amount"), "fiea")
+        self.assertEqual(abbreviate("filter env amount"), "fiEA")
+        # names with spaces: first word's letters + capital initial of the next word(s)
+        self.assertEqual(abbreviate("foo bar"), "fooB")
+        self.assertEqual(abbreviate("delay time"), "delT")
+        self.assertEqual(abbreviate("Delay Time"), "DelT")
+        self.assertEqual(abbreviate("osc 2 level"), "os2L")
+        self.assertEqual(abbreviate("a b c d e"), "aBCD")
+        self.assertEqual(abbreviate("  mix   level "), "mixL")
+        self.assertEqual(abbreviate("foo bar", case="upper"), "FOOB")
+        self.assertEqual(abbreviate("foo bar", case="title"), "FooB")
+        # camelCase / under_scores follow the same rule
+        self.assertEqual(abbreviate("fooBar"), "fooB")
+        self.assertEqual(abbreviate("filterEnv"), "filE")
+        self.assertEqual(abbreviate("filterEnvAmount"), "fiEA")
+        self.assertEqual(abbreviate("lfo_rate"), "lfoR")
+        self.assertEqual(abbreviate("LFORate"), "LFOR")
+        self.assertEqual(abbreviate("j.reverb"), "jRev")
+        self.assertEqual(abbreviate("j.reverb", 3), "jRe")
+        self.assertEqual(abbreviate("x y"), "xY")
+        self.assertEqual(abbreviate("filterEnv amount"), "filA")  # spaces win; camel word kept whole
         # other styles
         self.assertEqual(abbreviate("cutoff", case="title"), "Cutf")
         self.assertEqual(abbreviate("osc2Level", case="title"), "Os2L")
@@ -725,6 +744,60 @@ class LiveDisplayTests(unittest.TestCase):
         n = len(self.overlays())
         time.sleep(0.12)
         self.assertEqual(len(self.overlays()), n)  # stopped flipping after release
+
+    def test_value_popup_on_turn(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_cc(0, 17, 127)  # group 1 encoder 2 = cutoff, turned to max
+        ov = self.overlays()
+        self.assertEqual(len(ov), 1)
+        rows = [ov[0][i:i + 20].rstrip() for i in range(0, 80, 20)]
+        self.assertEqual(rows, ["Cutoff", "20000", "############### 100%", "polysynth"])
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        # the runner reports the exact value back -> pop-up shows it
+        time.sleep(0.06)
+        b.on_osc("/rnbo/inst/0/params/cutoff", 1234.4)
+        rows = [self.overlays()[-1][i:i + 20].rstrip() for i in range(0, 80, 20)]
+        self.assertEqual(rows[1], "1234")
+
+    def test_value_popup_enum_and_throttle(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_cc(0, 21, 127)  # wave (enum) -> "square"
+        b.on_cc(0, 21, 0)    # immediately again: throttled, shown a moment later
+        self.assertEqual(len(self.overlays()), 1)
+        self.assertEqual(self.overlays()[0][20:40].rstrip(), "square")
+        time.sleep(0.1)
+        self.assertEqual(len(self.overlays()), 2)
+        self.assertEqual(self.overlays()[1][20:40].rstrip(), "sine")
+
+    def test_value_popup_not_for_runner_changes_or_when_off(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_osc("/rnbo/inst/0/params/cutoff", 500.0)  # value changed elsewhere, nobody turning
+        self.assertEqual(self.overlays(), [])
+        self.assertEqual(b.raw["0/cutoff"], 500.0)
+        b2 = self.make(value_popup=False)
+        self.midi.sysex.clear()
+        b2.on_cc(0, 17, 64)
+        self.assertEqual(self.overlays(), [])
+
+    def test_value_popup_waits_for_device_list(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        b.on_sysex(key_press(shift_key=15))  # holding the device list
+        self.midi.sysex.clear()
+        b.on_cc(0, 17, 64)
+        self.assertEqual(self.overlays(), [])
+        b._hide_overlay()
+
+    def test_format_value(self):
+        f = Bridge.format_value
+        self.assertEqual([f(3.0), f(0.5), f(12.345), f(123.45), f(4321.6), f("saw"), f(None)],
+                         ["3", "0.500", "12.35", "123.5", "4322", "saw", ""])
 
     def test_live_names_off(self):
         self.make(live_names=False, notify_graph_change=False)
