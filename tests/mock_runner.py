@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -85,12 +86,15 @@ class MockRunner:
     def __init__(self, tree=None):
         self.tree = tree or default_tree()
         self.requests: list[str] = []
+        self.delay = 0.0  # seconds every request waits before the answer (a frozen runner)
         runner = self
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):
                 path = self.path.split("?")[0].rstrip("/")
                 runner.requests.append(path)
+                if runner.delay:
+                    time.sleep(runner.delay)
                 node = runner.tree if path.startswith("/rnbo/inst") else None
                 for part in path[len("/rnbo/inst"):].strip("/").split("/") if node else []:
                     if part:

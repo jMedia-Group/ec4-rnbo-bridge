@@ -1389,6 +1389,42 @@ class TraceTests(unittest.TestCase):
             self.assertIn("osc_out", text)
             self.assertIn("1/mix", text)
 
+
+    def test_stall_context_whole_runner_vs_one_parameter(self):
+        from ec4trace import analyze
+        A, B = self.MIX, "/rnbo/inst/0/params/cutoff/normalized"
+        frozen = [(1.0, "set", "1/mix", A, 0.3), (1.0, "osc_out", A, 0.3), (6.0, "osc_in", A, 0.3),
+                  (2.0, "osc_out", B, 0.5), (6.0, "osc_in", B, 0.5)]
+        text = "\n".join(analyze(sorted(frozen)))
+        self.assertIn("took 5000 ms", text)
+        self.assertIn("1 change(s) to other parameters were sent; 0 answered within 100 ms", text)
+        self.assertIn("the runner sent nothing at all", text)
+        alive = [(1.0, "set", "1/mix", A, 0.3), (1.0, "osc_out", A, 0.3), (6.0, "osc_in", A, 0.3),
+                 (2.0, "osc_out", B, 0.5), (2.002, "osc_in", B, 0.5), (2.002, "osc_rx", B)]
+        text = "\n".join(analyze(sorted(alive)))
+        self.assertIn("1 answered within 100 ms", text)
+        self.assertIn("/rnbo/inst/0 x1 (so only this was stuck", text)
+        self.assertIn("turned: 1/mix x1", text)
+
+    def test_runner_check_command(self):
+        runner = MockRunner()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                conf = os.path.join(d, "config.json")
+                with open(conf, "w") as f:
+                    json.dump({"oscquery_port": runner.port}, f)
+                cmd = [sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf,
+                       "runner-check", "--seconds", "1"]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("answered quickly the whole time", r.stdout)
+                runner.delay = 0.3
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                self.assertIn("the runner took 3", r.stdout)
+                self.assertIn("cause is in the runner or the Pi", r.stdout)
+        finally:
+            runner.close()
+
     def test_no_recording_when_idle(self):
         b = Bridge(cfg(), midi=FakeMidi())
         b.on_cc(0, 16, 1)

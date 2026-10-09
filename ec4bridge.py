@@ -15,6 +15,7 @@ Subcommands:
   test-display     check that the EC4 accepts live display text (firmware 2.0+)
   monitor          show what the EC4 sends as you turn encoders (timing, skipped steps)
   trace            record what the running bridge does for a few seconds, and where it lags
+  runner-check     time small requests to the runner, to see whether it freezes on its own
 """
 
 from __future__ import annotations
@@ -694,6 +695,7 @@ class Bridge:
         return s
 
     def on_osc(self, address: str, *args):
+        self.trace.add("osc_rx", address)
         if not args:
             return
         raw_slot = self.by_raw.get(address)
@@ -1295,6 +1297,54 @@ def _service_pid() -> int | None:
         return None
 
 
+def cmd_runner_check(cfg: dict, args) -> int:
+    """Time tiny requests to the runner, to see whether it freezes by itself."""
+    from rnbo import fetch_value
+    host, port = cfg["runner_host"], cfg["oscquery_port"]
+    secs, every = float(args.seconds), 0.25
+    path = "/rnbo/jack/info/cpu_load"
+    try:
+        xruns0 = fetch_value(host, port, "/rnbo/jack/info/xrun_count", timeout=15)
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"Could not reach the runner at {host}:{port}: {exc}")
+        return 1
+    if _service_pid():
+        print("Note: the bridge service is running. For a clean result stop it first:\n"
+              "  sudo systemctl stop ec4bridge\n")
+    print(f"Asking the runner for one small value every {every} s for {secs:.0f} s.")
+    print("Don't touch anything (close the RNBO web interface too). Answers slower than 200 ms:\n")
+    times, slow = [], []
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        t = time.monotonic()
+        try:
+            fetch_value(host, port, path, timeout=30)
+            err = ""
+        except (urllib.error.URLError, OSError) as exc:
+            err = f" (error: {exc})"
+        dt = time.monotonic() - t
+        times.append(dt)
+        if dt > 0.2 or err:
+            slow.append(dt)
+            print(f"  {time.strftime('%H:%M:%S')}  the runner took {dt * 1000:.0f} ms to answer{err}", flush=True)
+        time.sleep(max(0.0, every - dt))
+    try:
+        xruns1 = fetch_value(host, port, "/rnbo/jack/info/xrun_count", timeout=15)
+    except (urllib.error.URLError, OSError):
+        xruns1 = None
+    times.sort()
+    print(f"\n{len(times)} requests: typical {times[len(times) // 2] * 1000:.0f} ms, "
+          f"slowest {times[-1] * 1000:.0f} ms, {len(slow)} slower than 200 ms")
+    if isinstance(xruns0, (int, float)) and isinstance(xruns1, (int, float)):
+        print(f"audio dropouts (JACK xruns) meanwhile: {int(xruns1 - xruns0)}")
+    if slow:
+        print("The runner froze with nothing else going on, so the cause is in the runner or the Pi, "
+              "not the EC4 or the bridge.")
+    else:
+        print("The runner answered quickly the whole time: on its own it doesn't freeze.")
+    return 0
+
+
 def cmd_trace(cfg: dict, args) -> int:
     """Ask the running bridge to record a timeline, then print its summary."""
     import glob
@@ -1345,6 +1395,8 @@ def main(argv=None) -> int:
     sub.add_parser("test-display", help="check live display text on the EC4")
     sub.add_parser("monitor", help="show what the EC4 sends, with timing")
     sub.add_parser("trace", help="record what the running bridge does for a few seconds, and where it lags")
+    p = sub.add_parser("runner-check", help="check whether the runner freezes on its own")
+    p.add_argument("--seconds", type=float, default=60)
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1353,7 +1405,7 @@ def main(argv=None) -> int:
     return {
         "run": cmd_run, "list": cmd_list, "capture-backup": cmd_capture_backup,
         "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display, "monitor": cmd_monitor,
-        "trace": cmd_trace,
+        "trace": cmd_trace, "runner-check": cmd_runner_check,
     }[args.cmd](cfg, args)
 
 

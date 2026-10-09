@@ -89,6 +89,11 @@ def analyze(events: list[tuple], params: dict[str, tuple[str, int]] | None = Non
                f"{len(to_ec4)} messages to the EC4")
     if not sets:
         out.append("no knob turns on mapped encoders were recorded")
+    else:
+        per: dict[str, int] = {}
+        for e in sets:
+            per[e[2]] = per.get(e[2], 0) + 1
+        out.append("turned: " + ", ".join(f"{k} x{n}" for k, n in sorted(per.items(), key=lambda x: -x[1])[:6]))
 
     # ---- EC4 -> bridge: stalls while turning --------------------------------------------
     by_key: dict[str, list[tuple]] = {}
@@ -155,8 +160,34 @@ def analyze(events: list[tuple], params: dict[str, tuple[str, int]] | None = Non
         out.append(f"runner: reported changes back after avg {_ms(sum(lats) / len(lats))}, "
                    f"slowest {_ms(max(lats))}; {missing} of {len(outs)} never reported back "
                    f"(normal for a few during fast turns)")
+        rx = [e for e in events if e[1] == "osc_rx"]  # everything the runner sent us
         for t, lat, addr in sorted(slow, key=lambda s: -s[1])[:5]:
             out.append(f"  at {rel(t)}: {params.get(addr, (addr,))[0] or addr} took {_ms(lat)}")
+            if lat < 0.3:
+                continue
+            a, b = t + 0.05, t + lat - 0.05
+            others = [o for o in outs if a <= o[0] <= b and o[2] != addr]
+            answered = 0
+            for o in others:
+                _, steps = params.get(o[2], ("", 0))
+                tol = max(1e-3, 0.5 / (steps - 1) + 1e-3) if steps and steps > 1 else 1e-3
+                if any(o[0] <= r[0] <= o[0] + 0.1 and abs(r[3] - o[3]) <= tol for r in rep_by_addr.get(o[2], [])):
+                    answered += 1
+            got = [e for e in rx if a <= e[0] <= b and e[2] != addr and e[2] != addr[:-len("/normalized")]]
+            if others:
+                out.append(f"    meanwhile {len(others)} change(s) to other parameters were sent; "
+                           f"{answered} answered within 100 ms")
+            if got:
+                srcs: dict[str, int] = {}
+                for e in got:
+                    parts = e[2].split("/")
+                    src = "/".join(parts[:4]) if e[2].startswith("/rnbo/inst/") else "/".join(parts[:3])
+                    srcs[src] = srcs.get(src, 0) + 1
+                out.append("    meanwhile the runner kept sending other updates: "
+                           + ", ".join(f"{k} x{n}" for k, n in sorted(srcs.items(), key=lambda x: -x[1])[:4])
+                           + " (so only this was stuck, not the whole runner)")
+            else:
+                out.append("    meanwhile the runner sent nothing at all (the whole runner was stuck)")
     elif outs:
         out.append(f"runner: none of the {len(outs)} changes were reported back")
 
@@ -201,6 +232,8 @@ def format_events(events: list[tuple], params: dict[str, tuple[str, int]] | None
     lines = []
     for e in events:
         t, kind, *f = e
+        if kind == "osc_rx" and f[0].endswith("/normalized"):
+            continue  # shown as osc_in
         if kind in ("osc_out", "osc_in"):
             f = [params.get(f[0], (f[0],))[0] or f[0], f"{f[1]:.4f}"] + f[2:]
         elif kind in ("to_ec4_sysex", "from_ec4_sysex"):

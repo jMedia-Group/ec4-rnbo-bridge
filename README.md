@@ -221,6 +221,10 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
      parameters. The full timeline is saved as `trace-<date>.txt` in this folder. Without the
      command: `sudo systemctl kill -s USR1 ec4bridge`, then `journalctl -u ec4bridge -n 30`.
      `trace_seconds` (default 20) sets the length.
+  6. If the trace shows the runner taking seconds to report changes back, check whether it freezes
+     on its own: stop the bridge (`sudo systemctl stop ec4bridge`), close the web interface, and run
+     `venv/bin/python ec4bridge.py runner-check` (60 s; `--seconds N` to change). It asks the runner
+     for one small value every 0.25 s and prints every answer slower than 200 ms, with the time.
 
 - **"Receive error" on the EC4 during `send-layout`**: something else reached the EC4 in the middle
   of the dump. `send-layout` and `capture-backup` pause a running bridge service automatically
