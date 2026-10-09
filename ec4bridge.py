@@ -75,6 +75,7 @@ DEFAULTS = {
     "value_popup_mode": "rest",
     "value_popup_rest_ms": 120,
     "value_popup_interval_ms": 250,
+    "display_quiet_ms": 400,
     "units": {},
     "notify_graph_change": True,
     "notify_seconds": 2.5,
@@ -202,6 +203,7 @@ class Bridge:
         self.by_raw: dict[str, Slot] = {}
         self._polled: dict[str, float] = {}  # normalized values seen in the last poll
         self._sent_cc: dict[tuple[int, int], tuple[int, float]] = {}  # what we last sent the EC4
+        self.feedback_counts: dict[str, int] = {}  # values sent back to the EC4, per parameter
         self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
         self._popup_pending: tuple[Slot, object] | None = None
         self._popup_last = 0.0
@@ -650,6 +652,9 @@ class Bridge:
             self.values[k] = norm
             self.touched[k] = self._last_turn = time.monotonic()
             addr = slot.param.address
+        hold = getattr(self.midi, "hold_display", None) if self.midi is not None else None
+        if hold:  # nothing is drawn on the EC4 until the knob has rested this long
+            hold(float(self.cfg.get("display_quiet_ms", 400)) / 1000.0)
         if self.osc_send:
             self.osc_send(addr, float(norm))
         # show the name and value right away (a linear estimate); the runner's exact value
@@ -701,6 +706,7 @@ class Bridge:
         now = time.monotonic()
         for ch, cc, val in msgs:
             self._sent_cc[(ch, cc)] = (val, now)
+        self.feedback_counts[slot.param.key] = self.feedback_counts.get(slot.param.key, 0) + 1
         self.midi.send_ccs(msgs, pause=0)
 
     def resync(self):
@@ -777,6 +783,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
 
     runner_ok = False
     last_refresh = time.monotonic()
+    last_stats = time.monotonic()
     slow_logged = 0.0
     log.info("bridge started; runner %s, EC4 match '%s', setup %s, %s",
              cfg["runner_host"], cfg["midi_port"], cfg["ec4_setup"], cfg["resolution"])
@@ -817,6 +824,17 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
                 bridge.request_ec4_state()
                 bridge.resync()
                 bridge.write_names()
+            if time.monotonic() - last_stats >= 10 and hasattr(midi, "take_stats"):
+                span = time.monotonic() - last_stats
+                last_stats = time.monotonic()
+                st = midi.take_stats()
+                fb, bridge.feedback_counts = bridge.feedback_counts, {}
+                if st["cc"] or st["sysex"] or st["display"] or st["received_cc"]:
+                    busiest = ", ".join(f"{k} {n}" for k, n in sorted(fb.items(), key=lambda x: -x[1])[:3])
+                    log.info("last %ds: from EC4 %d knob msgs; to EC4 %d values, %d display, %d other%s%s",
+                             span, st["received_cc"], st["cc"], st["display"], st["sysex"],
+                             f"; most updated: {busiest}" if busiest else "",
+                             f"; input overflows so far: {st['overruns']}" if st["overruns"] else "")
             refresh = float(cfg["live_names_refresh"] or 0)
             if refresh and time.monotonic() - last_refresh >= refresh:
                 last_refresh = time.monotonic()

@@ -68,6 +68,7 @@ class EC4Midi:
             self.log(f"could not enlarge MIDI input buffer: {exc}")
         self._overruns = 0
         self._overrun_logged = 0.0
+        self._received_cc = 0
 
     # ---- device discovery -------------------------------------------------
     def find_device(self):
@@ -141,6 +142,18 @@ class EC4Midi:
         if self._device:
             self._queue.set_visible(visible)
 
+    def hold_display(self, seconds: float):
+        self._queue.hold_display(seconds)
+
+    def take_stats(self) -> dict:
+        """Messages written to / received from the EC4 since the last call."""
+        s = dict(self._queue.stats)
+        for k in self._queue.stats:
+            self._queue.stats[k] = 0
+        s["received_cc"], self._received_cc = self._received_cc, 0
+        s["overruns"] = self._overruns
+        return s
+
     def invalidate_display(self, display: int | None = None, visibility: bool = False):
         self._queue.invalidate(display, visibility)
 
@@ -198,6 +211,7 @@ class EC4Midi:
             if ev is None:
                 continue
             if isinstance(ev, ControlChangeEvent) and self.on_cc:
+                self._received_cc += 1
                 self.on_cc(ev.channel, ev.param, ev.value)
             elif isinstance(ev, SysExEvent):
                 data = bytes(ev.data)

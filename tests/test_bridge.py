@@ -1028,6 +1028,9 @@ class SlowEC4:
     def invalidate_display(self, d=None, visibility=False):
         self.q.invalidate(d, visibility)
 
+    def hold_display(self, seconds):
+        self.q.hold_display(seconds)
+
 
 class DisplayPacingTests(unittest.TestCase):
     def test_one_message_in_flight_and_latest_state_wins(self):
@@ -1089,6 +1092,23 @@ class DisplayPacingTests(unittest.TestCase):
         self.assertGreaterEqual(times[2] - times[1], 0.09)
         ec4.q.close()
 
+    def test_modulated_parameters_wait_while_turning(self):
+        ec4 = SlowEC4(delay=0.0)
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none", display_quiet_ms=200),
+                   midi=ec4, osc_send=lambda a, v: None)
+        b.update_from_params(parse_params(default_tree()))
+        ec4.q.flush(3)
+        ec4.sent.clear()
+        for i in range(20):  # turn cutoff while 'mix' is modulated inside the patch
+            b.on_cc(0, 17, 40 + i)
+            b.on_osc("/rnbo/inst/1/params/mix/normalized", i / 40)
+            time.sleep(0.01)
+        self.assertEqual(ec4.sent, [])  # nothing went to the EC4 mid-turn
+        ec4.q.flush(2)
+        self.assertEqual(ec4.sent, [(2, 18, round(19 / 40 * 127))])  # just the latest, afterwards
+        self.assertEqual(b.feedback_counts.get("1/mix"), 20)
+        ec4.q.close()
+
     def test_ccs_are_not_held_up_by_display(self):
         ec4 = SlowEC4(delay=0.5)
         ec4.display_text(rm.DISPLAY_OVERLAY, 0, "x" * 80)
@@ -1096,6 +1116,43 @@ class DisplayPacingTests(unittest.TestCase):
         ec4.send_ccs([(0, 16, 5)])
         time.sleep(0.05)
         self.assertEqual(ec4.sent, [(0, 16, 5)])
+        ec4.q.close()
+
+    def test_nothing_drawn_while_a_knob_moves(self):
+        ec4 = SlowEC4(delay=0.0)
+        ec4.q.hold_display(0.2)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, "x" * 80)
+        ec4.overlay_visible(False)
+        ec4.send_ccs([(0, 16, 9)])
+        time.sleep(0.1)
+        self.assertEqual(ec4.sysex, [])  # held
+        self.assertEqual(ec4.sent, [])  # values for the EC4 wait too
+        ec4.q.hold_display(0.2)  # still turning: hold extends
+        time.sleep(0.15)
+        self.assertEqual(ec4.sysex, [])
+        self.assertTrue(ec4.q.flush(2))
+        self.assertEqual(len(ec4.sysex), 2)  # drawn once the knob rested
+        self.assertEqual(ec4.sent, [(0, 16, 9)])
+        ec4.q.close()
+
+    def test_bridge_holds_display_during_turns(self):
+        ec4 = SlowEC4(delay=0.0)
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none", display_quiet_ms=300),
+                   midi=ec4, osc_send=lambda a, v: None)
+        b.update_from_params(parse_params(default_tree()))
+        b.on_sysex(report(15, 0))
+        ec4.q.flush(3)
+        ec4.sysex.clear()
+        t_last = 0.0
+        for v in range(30, 60):  # 0.3 s turn
+            b.on_cc(0, 17, v)
+            t_last = time.monotonic()
+            time.sleep(0.01)
+        b.on_sysex(report(15, 1))  # e.g. a group change asks for new names meanwhile
+        ec4.q.flush(3)
+        self.assertTrue(ec4.sysex)
+        self.assertGreaterEqual(min(t for t, _ in ec4.sysex) - t_last, 0.28)  # only after the rest
+        b._hide_overlay()
         ec4.q.close()
 
     def test_fast_turning_with_popup_stays_within_ec4_pace(self):

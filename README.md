@@ -189,6 +189,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `value_popup` | `true` | while you turn an encoder, show its full name, value, a level bar and the device |
 | `units` | `{}` | units shown after values in the pop-up, keyed like `names` (`{"0/cutoff": "Hz", "attack": "ms"}`); overrides the unit from RNBO |
 | `value_popup_mode` | `rest` | `rest`: draw the pop-up once the knob pauses (`value_popup_rest_ms`, 120); `live`: also redraw while turning, at most every `value_popup_interval_ms` (250). The EC4 stops sending knob data while it draws, so `live` makes knobs less smooth |
+| `display_quiet_ms` | 400 | while a knob moves and until it has been still this long, nothing is sent to the EC4 (values of other parameters, pop-ups, names); it catches up afterwards. The EC4 stops reading its knobs while it handles incoming data, so this keeps turns smooth |
 | `value_popup_seconds` | 1.5 | how long that stays after you stop turning |
 | `zero_unused` | `true` | set every encoder without a parameter to 0 (on a new graph, at start-up and when you return to the RNBO setup), so no values are left over from the previous graph |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |

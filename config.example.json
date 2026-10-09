@@ -43,6 +43,7 @@
   "value_popup_seconds": 1.5,
   "value_popup_mode": "rest",
   "value_popup_rest_ms": 120,
+  "display_quiet_ms": 400,
   "units": { "0/cutoff": "Hz" },
 
   "backup_syx": "ec4-backup.syx",
