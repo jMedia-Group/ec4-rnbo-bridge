@@ -71,7 +71,20 @@ DEFAULTS = {
     "notify_graph_change": True,
     "notify_seconds": 2.5,
     "notify_group_change": True,
+    "push_jumps_to_group": True,
+    "device_list_key": "shift+16",
+    "device_list_seconds": 8,
 }
+
+
+def parse_list_key(key: str):
+    """'shift+16' -> ('shift', 15); 'user1' -> ('user', 1); anything else -> None."""
+    key = (key or "").strip().lower().replace(" ", "")
+    if key.startswith("shift+") and key[6:].isdigit() and 1 <= int(key[6:]) <= 16:
+        return ("shift", int(key[6:]) - 1)
+    if key.startswith("user") and key[4:].isdigit() and 1 <= int(key[4:]) <= 4:
+        return ("user", int(key[4:]))
+    return None
 
 
 def load_config(path: str | None) -> dict:
@@ -112,6 +125,9 @@ def load_config(path: str | None) -> dict:
                 _re.compile(str(pat))
             except _re.error as exc:
                 raise SystemExit(f"hide_devices entry {pat!r} is not a valid pattern: {exc}")
+    key = cfg["device_list_key"] = str(cfg["device_list_key"] or "off").strip().lower().replace(" ", "")
+    if parse_list_key(key) is None and key != "off":
+        raise SystemExit('device_list_key must be "shift+1".."shift+16", "user1".."user4" or "off"')
     from layout import GROUP_TITLE_STYLES
     cfg["group_title_style"] = str(cfg["group_title_style"] or "instance").strip().lower()
     if cfg["group_title_style"] not in GROUP_TITLE_STYLES:
@@ -163,6 +179,8 @@ class Bridge:
         self.cur_group: int | None = None
         self._overlay_timer: threading.Timer | None = None
         self.hold = False  # True while this process itself is transferring a dump
+        self._list_page: int | None = None  # device list page on screen, None = closed
+        self._list_until = 0.0
         self._was_paused = False
 
     # ---- layout ------------------------------------------------------------
@@ -229,6 +247,10 @@ class Bridge:
         rep = ec4_remote.parse_report(msg)
         if not rep:
             return
+        if rep.get("pressed") and self._is_list_key(rep):
+            if self.on_my_setup():
+                self.toggle_device_list()
+            return
         with self.lock:
             was_mine = self.on_my_setup() and self.cur_setup is not None
             old_group = self.cur_group
@@ -242,8 +264,12 @@ class Bridge:
             self.write_names()
         elif mine and self.cur_group != old_group:
             self.write_names()
+            list_was_open = self._list_page is not None
+            self._list_page = None
             if old_group is not None and self.cfg["notify_group_change"] and self.cur_group is not None:
                 self.notify(self._group_summary(self.cur_group))
+            elif list_was_open:
+                self._hide_overlay()
         elif was_mine and not mine:
             log.info("EC4 switched to setup %d; pausing until it's back on setup %d",
                      self.cur_setup + 1, self.my_setup + 1)
@@ -308,7 +334,7 @@ class Bridge:
             lines.append(f"page {pages.index(g) + 1} of {len(pages)}")
         return lines
 
-    def notify(self, lines: list[str]):
+    def notify(self, lines: list[str], seconds: float | None = None):
         """Show a short message on the EC4's 4x20 overlay."""
         if not self.on_my_setup() or self.midi is None:
             return
@@ -316,10 +342,71 @@ class Bridge:
         self._send_sysex(ec4_remote.overlay_show(True))
         if self._overlay_timer:
             self._overlay_timer.cancel()
-        self._overlay_timer = threading.Timer(float(self.cfg["notify_seconds"]),
-                                              lambda: self._send_sysex(ec4_remote.overlay_show(False)))
+        secs = float(self.cfg["notify_seconds"] if seconds is None else seconds)
+        self._overlay_timer = threading.Timer(secs, self._overlay_timeout)
         self._overlay_timer.daemon = True
         self._overlay_timer.start()
+
+    def _overlay_timeout(self):
+        self._list_page = None
+        self._send_sysex(ec4_remote.overlay_show(False))
+
+    def _hide_overlay(self):
+        if self._overlay_timer:
+            self._overlay_timer.cancel()
+        self._overlay_timeout()
+
+    # ---- device list (SHIFT + push encoder 16 by default) ----------------------
+    def _is_list_key(self, rep: dict) -> bool:
+        key = parse_list_key(self.cfg.get("device_list_key", ""))
+        if key is None:
+            return False
+        kind, n = key
+        return (kind == "shift" and rep.get("shift_key") == n) or (kind == "user" and rep.get("user_key") == n)
+
+    def device_list_pages(self) -> list[list[str]]:
+        """Overlay pages listing 'group device' entries, 8 per page (2 columns x 4 rows)."""
+        from layout import strip_prefixes
+        prefixes = self.cfg.get("strip_prefixes") or []
+        with self.lock:
+            slots = list(self.layout.slots)
+        groups: dict[int, Slot] = {}
+        for s in slots:
+            groups.setdefault(s.group, s)
+        pages_of: dict[int, list[int]] = {}
+        for g, s in sorted(groups.items()):
+            pages_of.setdefault(s.param.inst, []).append(g)
+        entries = []
+        for g, s in sorted(groups.items()):
+            name = strip_prefixes(s.param.inst_name, prefixes)
+            own = pages_of[s.param.inst]
+            if len(own) > 1:
+                name = name[:6] + str(own.index(g) + 1)
+            entries.append(f"{g + 1:>2} {name[:7]:<7}")
+        if not entries:
+            return [["No devices loaded"]]
+        pages = []
+        for i in range(0, len(entries), 8):
+            chunk = entries[i:i + 8]
+            lines = ["".join(chunk[j:j + 2]) for j in range(0, len(chunk), 2)]
+            pages.append(lines)
+        return pages
+
+    def toggle_device_list(self):
+        """First press shows the list, further presses page through it, then close it."""
+        pages = self.device_list_pages()
+        now = time.monotonic()
+        if self._list_page is not None and now < self._list_until:
+            nxt = self._list_page + 1
+            if nxt >= len(pages):
+                self._hide_overlay()
+                return
+        else:
+            nxt = 0
+        secs = float(self.cfg["device_list_seconds"])
+        self.notify(pages[nxt], seconds=secs)
+        self._list_page = nxt
+        self._list_until = now + secs
 
     # ---- EC4 -> runner -----------------------------------------------------
     def on_cc(self, channel: int, cc: int, value: int):
@@ -403,6 +490,7 @@ def write_layout_syx(cfg: dict, layout: Layout) -> bytes:
         dump, int(cfg["ec4_setup"]) - 1, cfg["setup_name"], layout.group_names, layout.encoder_names(),
         cc_base=int(cfg["cc_base"]), resolution=cfg["resolution"], mode=cfg["encoder_mode"],
         display=cfg["display"] or None, live_names=bool(cfg["live_names"]),
+        push_jumps=bool(cfg["push_jumps_to_group"]),
     )
     data = ec4_sysex.build_dump(dump)
     tmp = cfg["layout_syx"] + ".tmp"

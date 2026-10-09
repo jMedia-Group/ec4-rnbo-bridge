@@ -42,6 +42,7 @@ F_NAMES = 128  # 16 x 4 chars
 TYPE_CC_ABS = 2
 TYPE_CC_14BIT = 4
 PB_TYPE_OFF = 0
+PB_TYPE_GROUP = 6  # push button selects a group; its channel field holds the group (0-based)
 
 SCALE_OFF = 0
 SCALE_100 = 2
@@ -198,7 +199,8 @@ def read_names(dump: Dump, setup: int) -> dict:
 
 def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str],
                  encoder_names: list[list[str | None]], *, cc_base: int, resolution: str,
-                 mode: str, display: str | None = None, live_names: bool = False) -> None:
+                 mode: str, display: str | None = None, live_names: bool = False,
+                 push_jumps: bool = False) -> None:
     """Program one setup (0-based) with the bridge's fixed MIDI scheme.
 
     Encoder e in group g sends CC (cc_base + e) on MIDI channel g+1, absolute mode.
@@ -208,6 +210,8 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
     live_names=True stores '----' as every encoder name and turns the value display on for every
     encoder: the EC4 only accepts names written live over SysEx on encoders named '----'
     (EC4 manual V03), and which encoders are in use changes with every graph.
+    push_jumps=True makes encoder N's push button jump to group N (the EC4's own "Grp" type);
+    otherwise push buttons are off.
     """
     if not 0 <= setup < 16:
         raise ValueError("setup must be 0..15")
@@ -250,7 +254,10 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
             m[base + F_UPPER + e] = upper
             m[base + F_MODE_SCALE + e] = (mode_code << 4) | scale
             m[base + F_LIMIT_MSB + e] = msbs
-            m[base + F_PB_TYPE_CHANNEL + e] = (PB_TYPE_OFF << 4) | g
+            if push_jumps:
+                m[base + F_PB_TYPE_CHANNEL + e] = (PB_TYPE_GROUP << 4) | e
+            else:
+                m[base + F_PB_TYPE_CHANNEL + e] = (PB_TYPE_OFF << 4) | g
             a = base + F_NAMES + e * 4
             stored = LIVE_NAME_PLACEHOLDER if live_names else (name or "")
             m[a:a + 4] = clean_name(stored).encode("latin-1")

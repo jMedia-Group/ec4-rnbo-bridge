@@ -104,6 +104,18 @@ the EC4 which setup it's on, shows a test message for 4 seconds, then writes `T0
 names for 4 seconds. If the test names don't appear, the stored names aren't `----` yet: run
 `send-layout`.
 
+### Device list and jumping to a group
+
+- **SHIFT + push encoder 16** pops up a list of the loaded devices with their group numbers,
+  e.g. ` 1 Synth1  2 Synth2` / ` 3 Delay`. With more than 8 groups in use, press it again for
+  the next page; once more closes it (it also closes by itself after `device_list_seconds`).
+- **Push encoder N** to jump to group N. This uses the EC4's own "Grp" push-button type, which
+  `send-layout` programs into the RNBO setup (`push_jumps_to_group`), so run `send-layout` once.
+  After the jump, the new group's names appear and the pop-up shows which device you're on.
+
+If SHIFT + push doesn't bring up the list on your EC4, set `"device_list_key": "user1"` and
+use user key 1 instead (hold FUNC and press encoder 1).
+
 ## Run it as a service
 
 ```bash
@@ -147,6 +159,9 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `live_names` | `true` | write names onto the EC4 display live (firmware 2.0+) |
 | `notify_graph_change` | `true` | pop up a short message on the EC4 when a new graph loads |
 | `notify_seconds` | 2.5 | how long that message stays |
+| `push_jumps_to_group` | `true` | encoder N's push button jumps to group N (needs `send-layout`); `false` = pushes off |
+| `device_list_key` | `shift+16` | key that shows the device list: `shift+1`…`shift+16`, `user1`…`user4` (FUNC + encoder 1/5/9/13), or `off` |
+| `device_list_seconds` | 8 | how long the device list stays up |
 | `notify_group_change` | `true` | pop up the instance name when you switch groups |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |

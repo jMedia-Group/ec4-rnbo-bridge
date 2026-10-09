@@ -15,6 +15,9 @@ and every command is 3 bytes: 0x4x, 0x20|high nibble, 0x10|low nibble.
   F0 00 00 00 4E 20 10 F7   ask the EC4 for its state
 The EC4 reports (and sends whenever you change them):
   4E 28 1s   current setup (0-based)      4E 24 1g   current group (0-based)
+and key events, followed by 4E 2E 11 (pressed) or 4E 2E 10 (released):
+  4E 2A 1k   SHIFT + push button k (0-based)
+  4E 26 1x   special key: 11 = SHIFT, 12..15 = user keys 1..4 (FUNC + encoder 1/5/9/13)
 """
 
 from __future__ import annotations
@@ -26,6 +29,9 @@ CMD_APP = 0x4E
 APP_DISPLAY = 0x22
 APP_GROUP = 0x24
 APP_SETUP = 0x28
+APP_EXT_KEY = 0x26
+APP_SHIFTED_KEY = 0x2A
+APP_KEY_STATE = 0x2E
 
 DISPLAY_NAMES = 0
 DISPLAY_OVERLAY = 3
@@ -67,7 +73,11 @@ def overlay_show(visible: bool) -> bytes:
 
 
 def parse_report(msg: bytes) -> dict | None:
-    """Return {'setup': n, 'group': n} (either may be missing) for an EC4 state message."""
+    """Parse an EC4 state/key message.
+
+    Returns any of: 'setup', 'group' (0-based), 'shift_key' (0-based push button pressed with
+    SHIFT), 'user_key' (1..4), 'shift' (True for the SHIFT key itself), 'pressed' (bool).
+    """
     if not msg.startswith(HEADER) or not msg.endswith(b"\xf7"):
         return None
     body = msg[len(HEADER):-1]
@@ -80,4 +90,13 @@ def parse_report(msg: bytes) -> dict | None:
             out["setup"] = val - 0x10
         elif cmd == APP_GROUP:
             out["group"] = val - 0x10
+        elif cmd == APP_SHIFTED_KEY:
+            out["shift_key"] = val - 0x10
+        elif cmd == APP_EXT_KEY:
+            if val == 0x11:
+                out["shift"] = True
+            elif 0x12 <= val <= 0x15:
+                out["user_key"] = val - 0x11
+        elif cmd == APP_KEY_STATE:
+            out["pressed"] = val == 0x11
     return out or None

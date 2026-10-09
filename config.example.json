@@ -32,6 +32,9 @@
   "notify_graph_change": true,
   "notify_seconds": 2.5,
   "notify_group_change": true,
+  "push_jumps_to_group": true,
+  "device_list_key": "shift+16",
+  "device_list_seconds": 8,
   "live_names_refresh": 0,
 
   "backup_syx": "ec4-backup.syx",

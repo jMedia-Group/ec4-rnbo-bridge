@@ -123,6 +123,17 @@ class SysexTests(unittest.TestCase):
         sx.apply_layout(d, 15, "RNBO", ["syn"], names, cc_base=16, resolution="7bit", mode="Acc1")
         self.assertEqual(sx.read_names(d, 15)["encoders"][0][:2], ["cutf", "    "])
 
+    def test_push_buttons_jump_to_groups(self):
+        d = synthetic_dump()
+        names = [[None] * 16 for _ in range(16)]
+        sx.apply_layout(d, 15, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1", push_jumps=True)
+        for g in (0, 9):
+            b = sx._group_base(15, g)
+            self.assertEqual([d.memory[b + 112 + e] for e in range(16)], [0x60 | e for e in range(16)])
+        sx.apply_layout(d, 15, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1")
+        b = sx._group_base(15, 9)
+        self.assertEqual({d.memory[b + 112 + e] for e in range(16)}, {0x09})  # off
+
     def test_14bit_limits(self):
         d = synthetic_dump()
         names = [["Abcd"] * 16 for _ in range(16)]
@@ -415,6 +426,16 @@ class RunLoopTest(unittest.TestCase):
 import ec4_remote as rm  # noqa: E402
 
 
+def key_press(shift_key=None, user_key=None, pressed=True):
+    body = []
+    if shift_key is not None:
+        body += [0x4E, 0x2A, 0x10 + shift_key]
+    if user_key is not None:
+        body += [0x4E, 0x26, 0x11 + user_key]
+    body += [0x4E, 0x2E, 0x11 if pressed else 0x10]
+    return bytes([*rm.HEADER, *body, 0xF7])
+
+
 def report(setup=None, group=None):
     body = []
     if setup is not None:
@@ -440,6 +461,11 @@ class RemoteProtocolTests(unittest.TestCase):
         self.assertEqual(rm.overlay_text(["x"])[7:10], bytes([0x4E, 0x22, 0x13]))
         self.assertEqual(len(rm.overlay_text([])), 13 + 80 * 3 + 1)
         self.assertEqual(rm.REQUEST_INFO, bytes([0xF0, 0, 0, 0, 0x4E, 0x20, 0x10, 0xF7]))
+
+    def test_parse_key_events(self):
+        self.assertEqual(rm.parse_report(key_press(shift_key=15)), {"shift_key": 15, "pressed": True})
+        self.assertEqual(rm.parse_report(key_press(shift_key=0, pressed=False)), {"shift_key": 0, "pressed": False})
+        self.assertEqual(rm.parse_report(key_press(user_key=1)), {"user_key": 1, "pressed": True})
 
     def test_parse_report(self):
         self.assertEqual(rm.parse_report(report(15, 0)), {"setup": 15, "group": 0})
@@ -565,6 +591,64 @@ class LiveDisplayTests(unittest.TestCase):
         b = self.make(pause_file=pause)
         self.assertFalse(b.paused())
 
+    def overlays(self):
+        return [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+
+    def test_device_list_popup(self):
+        b = self.make(notify_group_change=True)
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # SHIFT + push encoder 16
+        ov = self.overlays()
+        self.assertEqual(len(ov), 1)
+        self.assertEqual(ov[0][:20], " 1 polysy1 2 polysy2")
+        self.assertEqual(ov[0][20:40], " 3 Delay".ljust(20))
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # again: only one page, so it closes
+        self.assertEqual(self.overlays(), [])
+        self.assertEqual(self.midi.sysex[-1], rm.overlay_show(False))
+        # open, then the user pushes encoder 3: the EC4 jumps to group 3 and reports it
+        b.on_sysex(key_press(shift_key=15))
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 2))
+        self.assertIsNone(b._list_page)
+        self.assertTrue(self.overlays()[0].startswith("Group 3"))
+        self.assertTrue(self.text(self.names_written()[-1]).startswith("timefedbmix "))
+
+    def test_device_list_ignores_release_other_keys_and_setups(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15, pressed=False))
+        b.on_sysex(key_press(shift_key=3))
+        b.on_sysex(key_press(user_key=1))
+        self.assertEqual(self.overlays(), [])
+        b.on_sysex(report(4, 0))  # user is on one of their own setups
+        b.on_sysex(key_press(shift_key=15))
+        self.assertEqual(self.overlays(), [])
+
+    def test_device_list_user_key_and_paging(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {str(i): make_instance(i, f"dev{i}", [("p", 0, 0.5)]) for i in range(10)}}
+        self.midi = FakeMidi()
+        b = Bridge(cfg(layout_txt=os.path.join(self.tmp.name, "l.txt"), backup_syx="none",
+                       device_list_key="user1"), midi=self.midi)
+        b.update_from_params(parse_params(tree))
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # not the configured key
+        self.assertEqual(self.overlays(), [])
+        b.on_sysex(key_press(user_key=1))
+        b.on_sysex(key_press(user_key=1))
+        ov = self.overlays()
+        self.assertEqual(len(ov), 2)
+        self.assertTrue(ov[0].startswith(" 1 dev0    2 dev1"))
+        self.assertTrue(ov[1].startswith(" 9 dev8   10 dev9"))
+        b.on_sysex(key_press(user_key=1))  # past the last page -> closed
+        self.assertIsNone(b._list_page)
+        b._hide_overlay()
+
     def test_live_names_off(self):
         self.make(live_names=False, notify_graph_change=False)
         self.assertEqual(self.midi.sysex, [])
@@ -655,6 +739,8 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(names["groups"][:3], ["pol1", "pol2", "Dely"])
                 self.assertEqual(names["encoders"][2][:3], ["----", "----", "----"])  # live names
                 self.assertEqual(set(sum(names["encoders"], [])), {"----"})
+                b0 = sx._group_base(15, 0)
+                self.assertEqual(out.memory[b0 + 112 + 4], 0x64)  # push 5 -> group 5
         finally:
             runner.close()
 
