@@ -981,6 +981,129 @@ class OutQueueTests(unittest.TestCase):
         q.close()
 
 
+class SlowEC4:
+    """Writes go to an OutQueue; the 'EC4' replies to each display message after `delay`."""
+
+    def __init__(self, delay=0.08, reply=True):
+        from outqueue import OutQueue
+        self.delay, self.reply = delay, reply
+        self.sent, self.sysex = [], []
+        self.connected = True
+        self.q = OutQueue(lambda ch, cc, v: self.sent.append((ch, cc, v)), self._write, ack_timeout=0.3)
+
+    def _write(self, data):
+        self.sysex.append((time.monotonic(), bytes(data)))
+        if self.reply and data[7:9] == bytes([0x4E, 0x22]):
+            threading.Timer(self.delay, self.q.ack).start()
+
+    def send_ccs(self, msgs, pause=0):
+        for m in msgs:
+            self.q.cc(*m)
+
+    def send_sysex(self, data):
+        self.q.sysex(data)
+
+    def display_text(self, d, o, t):
+        self.q.set_text(d, o, t)
+
+    def overlay_visible(self, v):
+        self.q.set_visible(v)
+
+    def invalidate_display(self, d=None, visibility=False):
+        self.q.invalidate(d, visibility)
+
+
+class DisplayPacingTests(unittest.TestCase):
+    def test_one_message_in_flight_and_latest_state_wins(self):
+        ec4 = SlowEC4(delay=0.1)
+        for i in range(30):  # the bridge updates the pop-up 30 times in quick succession
+            ec4.display_text(rm.DISPLAY_OVERLAY, 20, f"value {i:<14}")
+        self.assertTrue(ec4.q.flush(3))
+        msgs = [m for _, m in ec4.sysex]
+        self.assertLessEqual(len(msgs), 3)  # not 30: intermediate states were skipped
+        screen = [" "] * 80
+        for m in msgs:  # replay the writes onto a screen
+            i = 10
+            while m[i] == 0x4A:
+                pos = (m[i + 1] - 0x20) * 16 + (m[i + 2] - 0x10)
+                i += 3
+                while m[i] == 0x4D:
+                    screen[pos] = chr(((m[i + 1] & 0xF) << 4) | (m[i + 2] & 0xF))
+                    pos += 1
+                    i += 3
+        self.assertEqual("".join(screen[20:40]), "value 29".ljust(20))
+        ec4.q.close()
+
+    def test_only_changed_characters_are_sent(self):
+        ec4 = SlowEC4(delay=0.0)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, rm.overlay_rows(["Cutoff", "1000 Hz", "#####", "synth"]))
+        ec4.q.flush(2)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, rm.overlay_rows(["Cutoff", "1010 Hz", "#####", "synth"]))
+        ec4.q.flush(2)
+        last = ec4.sysex[-1][1]
+        self.assertEqual(last, rm.write_runs(3, [(22, "1")]))  # one character
+        ec4.q.invalidate(rm.DISPLAY_OVERLAY)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, rm.overlay_rows(["Cutoff", "1010 Hz", "#####", "synth"]))
+        ec4.q.flush(2)
+        self.assertEqual(len(ec4.sysex[-1][1]), 13 + 80 * 3 + 1)  # full rewrite after invalidate
+        ec4.q.close()
+
+    def test_visibility_sent_only_on_change(self):
+        ec4 = SlowEC4(delay=0.0)
+        for _ in range(5):
+            ec4.overlay_visible(True)
+        ec4.q.flush(2)
+        ec4.overlay_visible(True)
+        ec4.q.flush(2)
+        ec4.overlay_visible(False)
+        ec4.q.flush(2)
+        self.assertEqual([m for _, m in ec4.sysex], [rm.overlay_show(True), rm.overlay_show(False)])
+        ec4.q.close()
+
+    def test_paced_by_timeout_without_reply(self):
+        ec4 = SlowEC4(reply=False)
+        ec4.q.ack_timeout = 0.1
+        ec4.display_text(rm.DISPLAY_NAMES, 0, "a" * 64)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, "b" * 80)
+        ec4.overlay_visible(True)
+        self.assertTrue(ec4.q.flush(2))
+        times = [t for t, _ in ec4.sysex]
+        self.assertEqual(len(times), 3)
+        self.assertGreaterEqual(times[1] - times[0], 0.09)
+        self.assertGreaterEqual(times[2] - times[1], 0.09)
+        ec4.q.close()
+
+    def test_ccs_are_not_held_up_by_display(self):
+        ec4 = SlowEC4(delay=0.5)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, "x" * 80)
+        time.sleep(0.05)  # display message in flight, waiting for the EC4
+        ec4.send_ccs([(0, 16, 5)])
+        time.sleep(0.05)
+        self.assertEqual(ec4.sent, [(0, 16, 5)])
+        ec4.q.close()
+
+    def test_fast_turning_with_popup_stays_within_ec4_pace(self):
+        ec4 = SlowEC4(delay=0.08)
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none"), midi=ec4,
+                   osc_send=lambda a, v: None)
+        b.update_from_params(parse_params(default_tree()))
+        ec4.q.flush(3)
+        b.on_sysex(report(15, 0))
+        ec4.q.flush(3)
+        start = len(ec4.sysex)
+        t0 = time.monotonic()
+        v = 0
+        while time.monotonic() - t0 < 1.0:  # turn cutoff fast for one second
+            v = (v + 1) % 128
+            b.on_cc(0, 17, v)
+            time.sleep(0.005)
+        ec4.q.flush(3)
+        display_msgs = len(ec4.sysex) - start
+        self.assertLessEqual(display_msgs, 16)  # ~12/s at most, never a backlog
+        b._hide_overlay()
+        ec4.q.close()
+
+
 class CliTests(unittest.TestCase):
     def test_list_and_make_syx(self):
         runner = MockRunner()

@@ -283,10 +283,13 @@ class Bridge:
             return
         with self.lock:
             was_mine = self.on_my_setup() and self.cur_setup is not None
-            old_group = self.cur_group
+            old_group, old_setup = self.cur_group, self.cur_setup
             self.cur_setup = rep.get("setup", self.cur_setup)
             self.cur_group = rep.get("group", self.cur_group)
             mine = self.on_my_setup()
+        if (self.cur_setup, self.cur_group) != (old_setup, old_group):
+            # the EC4 redraws its stored names (and may drop the pop-up) when you switch
+            self._invalidate_display(ec4_remote.DISPLAY_NAMES, visibility=True)
         if mine and not was_mine:
             log.info("EC4 is on the RNBO setup (%d), group %s", self.my_setup + 1,
                      "?" if self.cur_group is None else self.cur_group + 1)
@@ -321,6 +324,31 @@ class Bridge:
         if self.midi is not None and getattr(self.midi, "connected", True) and not self.paused():
             self.midi.send_sysex(data)
 
+    # display text goes through the MIDI layer's diffing/pacing when it has one (the real EC4);
+    # otherwise (tests) as plain SysEx
+    def _display_text(self, display: int, offset: int, text: str):
+        if self.midi is None or not getattr(self.midi, "connected", True) or self.paused():
+            return
+        fn = getattr(self.midi, "display_text", None)
+        if fn:
+            fn(display, offset, text)
+        else:
+            self.midi.send_sysex(ec4_remote.write_text(display, offset, text))
+
+    def _show_overlay(self, visible: bool):
+        if self.midi is None or not getattr(self.midi, "connected", True) or self.paused():
+            return
+        fn = getattr(self.midi, "overlay_visible", None)
+        if fn:
+            fn(visible)
+        else:
+            self.midi.send_sysex(ec4_remote.overlay_show(visible))
+
+    def _invalidate_display(self, display: int | None = None, visibility: bool = False):
+        fn = getattr(self.midi, "invalidate_display", None) if self.midi is not None else None
+        if fn:
+            fn(display, visibility)
+
     def request_ec4_state(self):
         self._send_sysex(ec4_remote.REQUEST_INFO)
 
@@ -331,7 +359,7 @@ class Bridge:
         with self.lock:
             g = self.cur_group if self.cur_group is not None else 0
             names = self.layout.encoder_names()[g] if 0 <= g < 16 else [None] * 16
-        self._send_sysex(ec4_remote.names_page(names))
+        self._display_text(ec4_remote.DISPLAY_NAMES, 0, ec4_remote.names_text(names))
 
     def _graph_summary(self) -> list[str]:
         from layout import strip_prefixes
@@ -372,8 +400,8 @@ class Bridge:
         """
         if not self.on_my_setup() or self.midi is None:
             return
-        self._send_sysex(ec4_remote.overlay_text(lines))
-        self._send_sysex(ec4_remote.overlay_show(True))
+        self._display_text(ec4_remote.DISPLAY_OVERLAY, 0, ec4_remote.overlay_rows(lines))
+        self._show_overlay(True)
         self._overlay_visible = True
         self._overlay_owner = owner
         self._overlay_lines = [((l or "") + " " * 20)[:20] for l in (list(lines) + [""] * 4)[:4]]
@@ -393,7 +421,7 @@ class Bridge:
         self._list_held = False
         if self._rotate_timer:
             self._rotate_timer.cancel()
-        self._send_sysex(ec4_remote.overlay_show(False))
+        self._show_overlay(False)
 
     def _hide_overlay(self):
         if self._overlay_timer:
@@ -466,8 +494,8 @@ class Bridge:
             # same knob still turning: rewrite only the value and bar lines (rows 2-3)
             rows = [((l or "") + " " * 20)[:20] for l in lines]
             if rows[1:3] != self._overlay_lines[1:3]:
-                self._send_sysex(ec4_remote.write_text(ec4_remote.DISPLAY_OVERLAY, 20, rows[1] + rows[2]))
-                self._send_sysex(ec4_remote.overlay_show(True))
+                self._display_text(ec4_remote.DISPLAY_OVERLAY, 20, rows[1] + rows[2])
+                self._show_overlay(True)
                 self._overlay_lines[1:3] = rows[1:3]
             self._arm_overlay_timer(secs)
         else:
@@ -762,6 +790,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
                 bridge._was_paused = False
                 log.info("setup dump finished; resending values and names")
                 bridge.cur_setup = bridge.cur_group = None
+                bridge._invalidate_display()
                 bridge.request_ec4_state()
                 bridge.resync()
                 bridge.write_names()
@@ -988,7 +1017,8 @@ def cmd_monitor(cfg: dict, args) -> int:
 
     def on_sysex(msg):
         rep = ec4_remote.parse_report(msg)
-        what = ", ".join(f"{k}={v}" for k, v in rep.items()) if rep else f"{len(msg)} bytes"
+        what = (", ".join(f"{k}={v}" for k, v in rep.items()) if rep
+                else f"{len(msg)} bytes: {msg[:16].hex(' ')}")
         print(f"{time.monotonic() - t0:8.3f}s  SysEx from EC4: {what}", flush=True)
 
     midi = open_midi(cfg, on_cc=on_cc, on_sysex=on_sysex)

@@ -107,6 +107,7 @@ class EC4Midi:
         except Exception:
             pass
         self._device = addr
+        self._queue.invalidate()  # whatever is on its screens now is unknown
         self.log(f"EC4 connected: {dev.client_name}:{dev.name} ({addr[0]}:{addr[1]})")
         return True
 
@@ -127,6 +128,18 @@ class EC4Midi:
 
     def flush(self, timeout: float = 5.0) -> bool:
         return self._queue.flush(timeout)
+
+    # display text: only changes are sent, paced by the EC4's replies (see outqueue.py)
+    def display_text(self, display: int, offset: int, text: str):
+        if self._device:
+            self._queue.set_text(display, offset, text)
+
+    def overlay_visible(self, visible: bool):
+        if self._device:
+            self._queue.set_visible(visible)
+
+    def invalidate_display(self, display: int | None = None, visibility: bool = False):
+        self._queue.invalidate(display, visibility)
 
     def _write_cc(self, channel: int, cc: int, value: int):
         if not self._device:
@@ -191,6 +204,7 @@ class EC4Midi:
                 if data[-1:] == b"\xf7":
                     msg = bytes(self._sysex_buf)
                     self._sysex_buf = bytearray()
+                    self._queue.ack()  # the EC4 replies to each display message
                     if self.on_sysex:
                         self.on_sysex(msg)
 
