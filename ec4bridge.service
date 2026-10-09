@@ -1,7 +1,9 @@
 [Unit]
 Description=Faderfox EC4 <-> RNBO runner bridge
-After=rnbooscquery.service sound.target
-Wants=rnbooscquery.service
+# No ordering on rnbooscquery.service: that unit is After=multi-user.target, so ordering this
+# (multi-user) unit after it creates a cycle and systemd skips the bridge at boot. The bridge
+# simply retries until the runner answers.
+After=network.target sound.target
 
 [Service]
 Type=simple

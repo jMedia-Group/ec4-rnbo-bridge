@@ -14,7 +14,7 @@ sys.path.insert(0, HERE)
 
 import ec4_sysex as sx  # noqa: E402
 from ec4bridge import DEFAULTS, Bridge  # noqa: E402
-from layout import abbreviate, build_layout  # noqa: E402
+from layout import abbreviate, build_layout, format_table  # noqa: E402
 from mock_runner import MockRunner, default_tree  # noqa: E402
 from rnbo import parse_params  # noqa: E402
 
@@ -29,9 +29,13 @@ class FakeMidi:
 
     def __init__(self):
         self.sent = []
+        self.sysex = []
 
     def send_ccs(self, msgs, pause=0):
         self.sent += msgs
+
+    def send_sysex(self, data):
+        self.sysex.append(bytes(data))
 
 
 def cfg(**kw):
@@ -86,6 +90,7 @@ class SysexTests(unittest.TestCase):
         allowed = set(range(sx.ADDR_SETUP_NAMES + 60, sx.ADDR_SETUP_NAMES + 64))
         allowed |= set(range(sx.ADDR_GROUP_NAMES + 15 * 64, sx.ADDR_GROUP_NAMES + 16 * 64))
         allowed |= set(range(sx._group_base(15, 0), sx._group_base(15, 0) + 16 * 192))
+        allowed |= {sx.ADDR_KEY2 + (15 * 16 + g) * 32 + e for g in range(16) for e in range(16)}
         self.assertTrue(set(changed) <= allowed)
         # and the result is still a valid dump
         sx.parse_dump(sx.build_dump(d))
@@ -103,6 +108,47 @@ class SysexTests(unittest.TestCase):
             sx.apply_layout(d, 0, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1", display="1000")
         with self.assertRaises(ValueError):
             sx.apply_layout(d, 0, "R", [], names, cc_base=16, resolution="14bit", mode="Acc1", display="127")
+
+    def test_live_names_placeholders(self):
+        d = synthetic_dump()
+        names = [[None] * 16 for _ in range(16)]
+        names[0][0] = "cutf"
+        sx.apply_layout(d, 15, "RNBO", ["syn"], names, cc_base=16, resolution="7bit",
+                        mode="Acc1", live_names=True)
+        n = sx.read_names(d, 15)
+        self.assertEqual(set(sum(n["encoders"], [])), {"----"})  # every encoder writable live
+        self.assertEqual(n["groups"][0], "syn ")  # group names still stored
+        for g in (0, 7):
+            b = sx._group_base(15, g)
+            self.assertEqual({d.memory[b + 80 + e] & 0xF for e in range(16)}, {2})  # display on everywhere
+        sx.apply_layout(d, 15, "RNBO", ["syn"], names, cc_base=16, resolution="7bit", mode="Acc1")
+        self.assertEqual(sx.read_names(d, 15)["encoders"][0][:2], ["cutf", "    "])
+
+    def test_push_buttons_jump_to_groups(self):
+        d = synthetic_dump()
+        names = [[None] * 16 for _ in range(16)]
+        sx.apply_layout(d, 15, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1", push_jumps=True)
+        for g in (0, 9):
+            b = sx._group_base(15, g)
+            self.assertEqual([d.memory[b + 112 + e] for e in range(16)], [0x60 | e for e in range(16)])
+        sx.apply_layout(d, 15, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1")
+        b = sx._group_base(15, 9)
+        self.assertEqual({d.memory[b + 112 + e] for e in range(16)}, {0x09})  # off
+
+    def test_push_star_switched_off(self):
+        d = synthetic_dump()
+        k2 = sx.ADDR_KEY2
+        for i in range(16 * 16 * 32):  # every push button: star on, lower value 0x6c
+            d.memory[k2 + i] = 0xEC
+        before = bytes(d.memory)
+        names = [[None] * 16 for _ in range(16)]
+        sx.apply_layout(d, 15, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1", push_jumps=True)
+        for g in (0, 15):
+            a = k2 + (15 * 16 + g) * 32
+            self.assertEqual(set(d.memory[a:a + 16]), {0x6C})  # star off, lower value kept
+            self.assertEqual(set(d.memory[a + 16:a + 32]), {0xEC})  # link/upper bytes untouched
+        a = k2 + (3 * 16) * 32
+        self.assertEqual(d.memory[a:a + 512], before[a:a + 512])  # other setups untouched
 
     def test_14bit_limits(self):
         d = synthetic_dump()
@@ -162,6 +208,44 @@ class LayoutTests(unittest.TestCase):
         lay = build_layout(parse_params(tree), cfg())
         self.assertEqual(lay.group_names[0], "jre")  # without the option
 
+    def test_group_title_style(self):
+        lay = build_layout(self.params, cfg(group_title_style="number", group_names={"0": "Syn"}))
+        self.assertEqual(lay.group_names[:3], ["G01", "G02", "G03"])
+        self.assertEqual(lay.group_names[15], "G16")  # unused groups too
+        lay = build_layout(self.params, cfg(group_title_style="blank"))
+        self.assertEqual(set(lay.group_names), {""})
+        lay = build_layout(self.params, cfg())
+        self.assertEqual(lay.group_names[:3], ["pol1", "pol2", "Dely"])
+        # titles are stored in the dump and survive a round trip
+        d = synthetic_dump()
+        lay = build_layout(self.params, cfg(group_title_style="number"))
+        sx.apply_layout(d, 15, "RNBO", lay.group_names, lay.encoder_names(), cc_base=16,
+                        resolution="7bit", mode="Acc1", live_names=True)
+        names = sx.read_names(sx.parse_dump(sx.build_dump(d)), 15)
+        self.assertEqual(names["groups"][:2] + names["groups"][-1:], ["G01 ", "G02 ", "G16 "])
+
+    def test_hide_devices(self):
+        lay = build_layout(self.params, cfg(hide_devices=["delay"]))  # alias "Delay", any case
+        self.assertEqual({s.param.inst for s in lay.slots}, {0})
+        self.assertEqual(lay.hidden, ["1 Delay"])
+        lay = build_layout(self.params, cfg(hide_devices=["0"]))  # by instance number
+        self.assertEqual({s.param.inst for s in lay.slots}, {1})
+        self.assertEqual(lay.slots[0].group, 0)  # remaining device moves up to group 1
+        self.assertEqual(lay.group_names[0], "Dely")
+        lay = build_layout(self.params, cfg(hide_devices=["^poly"]))
+        self.assertEqual(lay.hidden, ["0 polysynth"])
+        lay = build_layout(self.params, cfg(hide_devices=["synth$", "1"]))
+        self.assertEqual(lay.slots, [])
+        self.assertIn("No parameters left after hiding devices", format_table(lay))
+        self.assertIn("Hidden devices (hide_devices): 0 polysynth, 1 Delay", format_table(lay))
+
+    def test_hide_devices_with_prefix(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {"0": make_instance(0, "j.reverb", [("size", 0, 0.5)]),
+                             "1": make_instance(1, "j.mix", [("gain", 0, 0.5)])}}
+        lay = build_layout(parse_params(tree), cfg(strip_prefixes=["j."], hide_devices=["^reverb$"]))
+        self.assertEqual([s.param.inst for s in lay.slots], [1])
+
     def test_overflow(self):
         many = parse_params(default_tree()) * 13  # 299 params
         lay = build_layout(many, cfg(new_group_per_instance=False))
@@ -203,8 +287,30 @@ class BridgeTests(unittest.TestCase):
 
     def test_resync_on_layout(self):
         self.make()
-        self.assertEqual(len(self.midi.sent), 23)
+        self.assertEqual(len(self.midi.sent), 256)  # 23 parameters + 233 unused encoders
         self.assertIn((0, 16, round(0.8 * 127)), self.midi.sent)  # volume, group 1 enc 1
+        self.assertIn((1, 20, 0), self.midi.sent)  # group 2 encoder 5: unused -> 0
+        self.assertIn((15, 31, 0), self.midi.sent)  # group 16 encoder 16: unused -> 0
+        self.assertNotIn((0, 16, 0), self.midi.sent)  # used encoders are not zeroed
+
+    def test_zero_unused_off(self):
+        self.make(zero_unused=False)
+        self.assertEqual(len(self.midi.sent), 23)
+
+    def test_new_graph_zeroes_leftovers(self):
+        b = self.make()
+        self.midi.sent.clear()
+        tree = default_tree()
+        tree["CONTENTS"].pop("0")  # new graph: only the 3-parameter delay
+        b.update_from_params(parse_params(tree))
+        self.assertIn((0, 19, 0), self.midi.sent)  # group 1 encoder 4 had a synth parameter -> 0
+        self.assertIn((1, 16, 0), self.midi.sent)  # old second synth page -> 0
+        self.assertIn((0, 16, 16), self.midi.sent)  # delay time moved here: 250 of 0..2000 -> 16
+
+    def test_zero_unused_14bit(self):
+        self.make(resolution="14bit")
+        self.assertIn((5, 16, 0), self.midi.sent)
+        self.assertIn((5, 48, 0), self.midi.sent)  # MSB and LSB
 
     def test_encoder_to_osc(self):
         b = self.make()
@@ -318,7 +424,7 @@ class RunLoopTest(unittest.TestCase):
                     time.sleep(0.05)
                 # listener registered with the runner, all values sent to the EC4
                 self.assertIn(("/rnbo/listeners/add", (f"127.0.0.1:{listen_port}",)), got)
-                self.assertEqual(len(fake.sent), 23)
+                self.assertEqual(len(fake.sent), 256)
                 # turn an encoder -> OSC to the runner
                 fake.on_cc(0, 17, 127)
                 for _ in range(50):
@@ -355,6 +461,336 @@ class RunLoopTest(unittest.TestCase):
         self.assertIn(("/rnbo/listeners/del", (f"127.0.0.1:{listen_port}",)), got)
 
 
+import ec4_remote as rm  # noqa: E402
+
+
+def key_press(shift_key=None, user_key=None, pressed=True):
+    body = []
+    if shift_key is not None:
+        body += [0x4E, 0x2A, 0x10 + shift_key]
+    if user_key is not None:
+        body += [0x4E, 0x26, 0x11 + user_key]
+    body += [0x4E, 0x2E, 0x11 if pressed else 0x10]
+    return bytes([*rm.HEADER, *body, 0xF7])
+
+
+def report(setup=None, group=None):
+    body = []
+    if setup is not None:
+        body += [0x4E, 0x28, 0x10 + setup]
+    if group is not None:
+        body += [0x4E, 0x24, 0x10 + group]
+    return bytes([*rm.HEADER, *body, 0xF7])
+
+
+class RemoteProtocolTests(unittest.TestCase):
+    """Byte layout must match DrivenByMoss' EC4Display/EC4ControlSurface."""
+
+    def test_names_page_bytes(self):
+        m = rm.names_page(["Ab", None] + [None] * 14)
+        self.assertEqual(m[:13], bytes([0xF0, 0, 0, 0, 0x4E, 0x2C, 0x1B, 0x4E, 0x22, 0x10, 0x4A, 0x20, 0x10]))
+        self.assertEqual(m[13:19], bytes([0x4D, 0x24, 0x11, 0x4D, 0x26, 0x12]))  # 'A' 0x41, 'b' 0x62
+        self.assertEqual(len(m), 13 + 64 * 3 + 1)
+        self.assertEqual(m[-1], 0xF7)
+
+    def test_overlay_and_requests(self):
+        self.assertEqual(rm.overlay_show(True)[-4:], bytes([0x4E, 0x22, 0x14, 0xF7]))
+        self.assertEqual(rm.overlay_show(False)[-4:], bytes([0x4E, 0x22, 0x15, 0xF7]))
+        self.assertEqual(rm.overlay_text(["x"])[7:10], bytes([0x4E, 0x22, 0x13]))
+        self.assertEqual(len(rm.overlay_text([])), 13 + 80 * 3 + 1)
+        self.assertEqual(rm.REQUEST_INFO, bytes([0xF0, 0, 0, 0, 0x4E, 0x20, 0x10, 0xF7]))
+
+    def test_parse_key_events(self):
+        self.assertEqual(rm.parse_report(key_press(shift_key=15)), {"shift_key": 15, "pressed": True})
+        self.assertEqual(rm.parse_report(key_press(shift_key=0, pressed=False)), {"shift_key": 0, "pressed": False})
+        self.assertEqual(rm.parse_report(key_press(user_key=1)), {"user_key": 1, "pressed": True})
+
+    def test_parse_report(self):
+        self.assertEqual(rm.parse_report(report(15, 0)), {"setup": 15, "group": 0})
+        self.assertEqual(rm.parse_report(report(group=3)), {"group": 3})
+        self.assertIsNone(rm.parse_report(bytes([0xF0, 0, 0, 0, 0x41, 0xF7])))
+        self.assertIsNone(rm.parse_report(rm.REQUEST_INFO))
+
+
+class LiveDisplayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def make(self, **kw):
+        self.midi = FakeMidi()
+        self.osc = []
+        d = self.tmp.name
+        c = cfg(layout_txt=os.path.join(d, "l.txt"), backup_syx=os.path.join(d, "none.syx"),
+                notify_seconds=0.1, **kw)
+        b = Bridge(c, midi=self.midi, osc_send=lambda a, v: self.osc.append((a, v)))
+        b.update_from_params(parse_params(default_tree()))
+        return b
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def names_written(self):
+        return [m for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x10])]
+
+    @staticmethod
+    def text(m):
+        return "".join(chr(((m[i + 1] & 0xF) << 4) | (m[i + 2] & 0xF)) for i in range(13, len(m) - 1, 3))
+
+    def test_names_written_on_start_and_group_change(self):
+        b = self.make()
+        pages = self.names_written()
+        self.assertEqual(len(pages), 1)
+        self.assertTrue(self.text(pages[0]).startswith("volmCutfresnatck"))
+        b.on_sysex(report(15, 2))  # user selects group 3 on the RNBO setup
+        self.assertTrue(self.text(self.names_written()[-1]).startswith("timefedbmix "))
+        b.on_sysex(report(15, 9))  # empty group -> blank names
+        self.assertEqual(self.text(self.names_written()[-1]), " " * 64)
+
+    def test_other_setup_is_left_alone(self):
+        b = self.make()
+        b.on_sysex(report(3, 0))  # user switches the EC4 to their own setup 4
+        self.midi.sent.clear()
+        self.midi.sysex.clear()
+        b.on_cc(0, 16, 100)  # that setup's encoder must not move RNBO
+        self.assertEqual(self.osc, [])
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.5)  # and no feedback goes out
+        b.update_from_params(parse_params(default_tree()))
+        self.assertEqual(self.midi.sent, [])
+        self.assertEqual(self.names_written(), [])
+        b.on_sysex(report(15, 0))  # back on the RNBO setup -> values + names resent
+        self.assertEqual(len(self.midi.sent), 256)
+        self.assertEqual(len(self.names_written()), 1)
+        b.on_cc(0, 16, 127)
+        self.assertEqual(self.osc[-1], ("/rnbo/inst/0/params/volume/normalized", 1.0))
+
+    def test_graph_change_notifies_and_renames(self):
+        b = self.make()
+        self.midi.sysex.clear()
+        tree = default_tree()
+        tree["CONTENTS"].pop("0")  # load a different graph
+        self.assertTrue(b.update_from_params(parse_params(tree)))
+        overlay = [m for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+        self.assertEqual(len(overlay), 1)
+        self.assertIn("RNBO graph loaded", self.text(overlay[0]))
+        self.assertIn(" 1 Delay", self.text(overlay[0]))
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        self.assertTrue(self.text(self.names_written()[-1]).startswith("timefedbmix "))
+        time.sleep(0.3)
+        self.assertEqual(self.midi.sysex[-1], rm.overlay_show(False))  # overlay hidden again
+
+    def test_group_change_popup(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 1))  # switch to group 2 = second page of the synth
+        overlay = [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+        self.assertEqual(len(overlay), 1)
+        self.assertTrue(overlay[0].startswith("Group 2"))
+        self.assertIn("polysynth", overlay[0])
+        self.assertIn("page 2 of 2", overlay[0])
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 2))
+        self.assertIn("Delay", [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])][0])
+
+    def test_group_popup_off(self):
+        b = self.make(notify_group_change=False)
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 2))
+        self.assertFalse(any(m[7:10] == bytes([0x4E, 0x22, 0x13]) for m in self.midi.sysex))
+        self.assertTrue(self.names_written())
+
+    def test_quiet_during_dump(self):
+        import ec4bridge
+        pause = os.path.join(self.tmp.name, "ec4bridge.pause")
+        b = self.make(pause_file=pause)
+        self.midi.sent.clear()
+        self.midi.sysex.clear()
+        with ec4bridge.pause_bridge(b.cfg, settle=0):
+            self.assertTrue(os.path.exists(pause))
+            b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.9)  # a moving parameter
+            b.resync()
+            b.write_names()
+            b.notify(["x"])
+            b.on_sysex(report(15, 2))  # even a group change must not trigger output
+            b.on_cc(0, 16, 64)
+        self.assertEqual(self.midi.sent, [])
+        self.assertEqual(self.midi.sysex, [])
+        self.assertEqual(self.osc, [])
+        self.assertFalse(os.path.exists(pause))
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.5)  # back to normal afterwards
+        self.assertEqual(self.midi.sent, [(2, 18, 64)])
+
+    def test_stale_pause_file_ignored(self):
+        pause = os.path.join(self.tmp.name, "old.pause")
+        open(pause, "w").close()
+        old = time.time() - 3600
+        os.utime(pause, (old, old))
+        b = self.make(pause_file=pause)
+        self.assertFalse(b.paused())
+
+    def overlays(self):
+        return [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+
+    def test_device_list_popup(self):
+        b = self.make(notify_group_change=True, device_list_mode="toggle")
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # SHIFT + push encoder 16
+        ov = self.overlays()
+        self.assertEqual(len(ov), 1)
+        self.assertEqual(ov[0][:20], " 1 polysy1 2 polysy2")
+        self.assertEqual(ov[0][20:40], " 3 Delay".ljust(20))
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # again: only one page, so it closes
+        self.assertEqual(self.overlays(), [])
+        self.assertEqual(self.midi.sysex[-1], rm.overlay_show(False))
+        # open, then the user pushes encoder 3: the EC4 jumps to group 3 and reports it
+        b.on_sysex(key_press(shift_key=15))
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 2))
+        self.assertIsNone(b._list_page)
+        self.assertTrue(self.overlays()[0].startswith("Group 3"))
+        self.assertTrue(self.text(self.names_written()[-1]).startswith("timefedbmix "))
+
+    def test_device_list_ignores_release_other_keys_and_setups(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15, pressed=False))
+        b.on_sysex(key_press(shift_key=3))
+        b.on_sysex(key_press(user_key=1))
+        self.assertEqual(self.overlays(), [])
+        b.on_sysex(report(4, 0))  # user is on one of their own setups
+        b.on_sysex(key_press(shift_key=15))
+        self.assertEqual(self.overlays(), [])
+
+    def test_device_list_user_key_and_paging(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {str(i): make_instance(i, f"dev{i}", [("p", 0, 0.5)]) for i in range(10)}}
+        self.midi = FakeMidi()
+        b = Bridge(cfg(layout_txt=os.path.join(self.tmp.name, "l.txt"), backup_syx="none",
+                       device_list_key="user1", device_list_mode="toggle"), midi=self.midi)
+        b.update_from_params(parse_params(tree))
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # not the configured key
+        self.assertEqual(self.overlays(), [])
+        b.on_sysex(key_press(user_key=1))
+        b.on_sysex(key_press(user_key=1))
+        ov = self.overlays()
+        self.assertEqual(len(ov), 2)
+        self.assertTrue(ov[0].startswith(" 1 dev0    2 dev1"))
+        self.assertTrue(ov[1].startswith(" 9 dev8   10 dev9"))
+        b.on_sysex(key_press(user_key=1))  # past the last page -> closed
+        self.assertIsNone(b._list_page)
+        b._hide_overlay()
+
+    def test_device_list_momentary(self):
+        b = self.make()  # default: momentary
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # hold SHIFT + push 16
+        self.assertEqual(self.overlays()[0][:20], " 1 polysy1 2 polysy2")
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        b.on_sysex(key_press(shift_key=15, pressed=False))  # let go
+        self.assertEqual(self.midi.sysex[-1], rm.overlay_show(False))
+        self.assertIsNone(b._list_page)
+        # letting go of SHIFT first also closes it
+        b.on_sysex(key_press(shift_key=15))
+        self.midi.sysex.clear()
+        b.on_sysex(bytes([*rm.HEADER, 0x4E, 0x26, 0x11, 0x4E, 0x2E, 0x10, 0xF7]))
+        self.assertEqual(self.midi.sysex, [rm.overlay_show(False)])
+        # a release with no list open sends nothing
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15, pressed=False))
+        self.assertEqual(self.midi.sysex, [])
+
+    def test_device_list_momentary_pages_flip(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {str(i): make_instance(i, f"dev{i}", [("p", 0, 0.5)]) for i in range(10)}}
+        self.midi = FakeMidi()
+        b = Bridge(cfg(layout_txt=os.path.join(self.tmp.name, "l.txt"), backup_syx="none",
+                       device_list_page_seconds=0.05), midi=self.midi)
+        b.update_from_params(parse_params(tree))
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))
+        time.sleep(0.08)
+        ov = self.overlays()
+        self.assertTrue(ov[0].startswith(" 1 dev0"))
+        self.assertTrue(ov[1].startswith(" 9 dev8"))
+        b.on_sysex(key_press(shift_key=15, pressed=False))
+        n = len(self.overlays())
+        time.sleep(0.12)
+        self.assertEqual(len(self.overlays()), n)  # stopped flipping after release
+
+    def test_live_names_off(self):
+        self.make(live_names=False, notify_graph_change=False)
+        self.assertEqual(self.midi.sysex, [])
+
+
+class FakeEC4(FakeMidi):
+    """Answers state requests like an EC4 on setup 3, group 1."""
+
+    def __init__(self, on_sysex):
+        super().__init__()
+        self.on_sysex = on_sysex
+        self.connected = False
+
+    def ensure_connected(self):
+        self.connected = True
+        return True
+
+    def close(self):
+        pass
+
+    def send_sysex(self, data):
+        super().send_sysex(data)
+        if data == rm.REQUEST_INFO:
+            self.on_sysex(report(2, 0))
+
+
+class TestDisplayCommandTests(unittest.TestCase):
+    def test_display_check(self):
+        import contextlib
+        import io
+
+        import ec4bridge
+        holder = {}
+
+        def fake_open(c, **kw):
+            holder["ec4"] = FakeEC4(kw["on_sysex"])
+            return holder["ec4"]
+
+        orig_open, orig_sleep = ec4bridge.open_midi, ec4bridge.time.sleep
+        ec4bridge.open_midi = fake_open
+        ec4bridge.time.sleep = lambda s: None
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = ec4bridge.cmd_test_display(cfg(), argparse_ns())
+        finally:
+            ec4bridge.open_midi, ec4bridge.time.sleep = orig_open, orig_sleep
+        text = out.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("EC4 reports setup 3, group 1", text)
+        self.assertIn("writes names only while it's on setup 16", text)
+        sent = holder["ec4"].sysex
+        self.assertIn(rm.overlay_show(True), sent)
+        self.assertIn(rm.overlay_show(False), sent)
+        pages = [m for m in sent if m[7:10] == bytes([0x4E, 0x22, 0x10])]
+        self.assertEqual(len(pages), 2)  # test names, then the real ones back
+        self.assertTrue(LiveDisplayTests.text(pages[0]).startswith("T01 T02 T03 T04 "))
+        self.assertFalse(any(m[7:9] == bytes([0x4E, 0x28]) for m in sent))  # never asks to switch setup
+
+
+def argparse_ns(**kw):
+    import argparse
+    return argparse.Namespace(**kw)
+
+
 class CliTests(unittest.TestCase):
     def test_list_and_make_syx(self):
         runner = MockRunner()
@@ -378,7 +814,10 @@ class CliTests(unittest.TestCase):
                     out = sx.parse_dump(f.read())
                 names = sx.read_names(out, 15)
                 self.assertEqual(names["groups"][:3], ["pol1", "pol2", "Dely"])
-                self.assertEqual(names["encoders"][2][:3], ["time", "fedb", "mix "])
+                self.assertEqual(names["encoders"][2][:3], ["----", "----", "----"])  # live names
+                self.assertEqual(set(sum(names["encoders"], [])), {"----"})
+                b0 = sx._group_base(15, 0)
+                self.assertEqual(out.memory[b0 + 112 + 4], 0x64)  # push 5 -> group 5
         finally:
             runner.close()
 

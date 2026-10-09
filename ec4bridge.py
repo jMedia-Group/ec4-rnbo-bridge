@@ -12,6 +12,7 @@ Subcommands:
   capture-backup   receive 'Send all setups' from the EC4 and save it
   make-syx         write an EC4 dump with the current layout and names
   send-layout      make the dump and send it to the EC4 (EC4 must be in Receive)
+  test-display     check that the EC4 accepts live display text (firmware 2.0+)
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import threading
 import time
 import urllib.error
 
+import ec4_remote
 import ec4_sysex
 from layout import Layout, Slot, build_layout, format_table
 from rnbo import Param, fetch_tree, parse_params
@@ -57,11 +59,35 @@ DEFAULTS = {
     "group_names": {},
     "strip_prefixes": [],
     "name_case": "keep",
+    "group_title_style": "instance",
+    "hide_devices": [],
     "backup_syx": "ec4-backup.syx",
     "layout_syx": "ec4-layout.syx",
     "layout_txt": "layout.txt",
+    "pause_file": "ec4bridge.pause",
     "sysex_page_pause_ms": 2,
+    "live_names": True,
+    "live_names_refresh": 0,
+    "zero_unused": True,
+    "notify_graph_change": True,
+    "notify_seconds": 2.5,
+    "notify_group_change": True,
+    "push_jumps_to_group": True,
+    "device_list_key": "shift+16",
+    "device_list_seconds": 8,
+    "device_list_mode": "momentary",
+    "device_list_page_seconds": 2,
 }
+
+
+def parse_list_key(key: str):
+    """'shift+16' -> ('shift', 15); 'user1' -> ('user', 1); anything else -> None."""
+    key = (key or "").strip().lower().replace(" ", "")
+    if key.startswith("shift+") and key[6:].isdigit() and 1 <= int(key[6:]) <= 16:
+        return ("shift", int(key[6:]) - 1)
+    if key.startswith("user") and key[4:].isdigit() and 1 <= int(key[4:]) <= 4:
+        return ("user", int(key[4:]))
+    return None
 
 
 def load_config(path: str | None) -> dict:
@@ -76,7 +102,7 @@ def load_config(path: str | None) -> dict:
         cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
     elif path:
         log.warning("config file %s not found, using defaults", path)
-    for k in ("backup_syx", "layout_syx", "layout_txt"):
+    for k in ("backup_syx", "layout_syx", "layout_txt", "pause_file"):
         if not os.path.isabs(cfg[k]):
             cfg[k] = os.path.join(base, cfg[k])
     if not 1 <= int(cfg["ec4_setup"]) <= 16:
@@ -93,6 +119,25 @@ def load_config(path: str | None) -> dict:
     cfg["name_case"] = str(cfg["name_case"] or "keep").strip().lower()
     if cfg["name_case"] not in NAME_CASES:
         raise SystemExit("name_case must be one of " + ", ".join(NAME_CASES))
+    if not isinstance(cfg["hide_devices"], list):
+        raise SystemExit('hide_devices must be a list, e.g. ["reverb", "2"]')
+    import re as _re
+    for pat in cfg["hide_devices"]:
+        if not str(pat).strip().isdigit():
+            try:
+                _re.compile(str(pat))
+            except _re.error as exc:
+                raise SystemExit(f"hide_devices entry {pat!r} is not a valid pattern: {exc}")
+    key = cfg["device_list_key"] = str(cfg["device_list_key"] or "off").strip().lower().replace(" ", "")
+    if parse_list_key(key) is None and key != "off":
+        raise SystemExit('device_list_key must be "shift+1".."shift+16", "user1".."user4" or "off"')
+    cfg["device_list_mode"] = str(cfg["device_list_mode"] or "momentary").strip().lower()
+    if cfg["device_list_mode"] not in ("momentary", "toggle"):
+        raise SystemExit('device_list_mode must be "momentary" or "toggle"')
+    from layout import GROUP_TITLE_STYLES
+    cfg["group_title_style"] = str(cfg["group_title_style"] or "instance").strip().lower()
+    if cfg["group_title_style"] not in GROUP_TITLE_STYLES:
+        raise SystemExit("group_title_style must be one of " + ", ".join(GROUP_TITLE_STYLES))
     if cfg["encoder_mode"] not in ec4_sysex.ENCODER_MODES:
         raise SystemExit("encoder_mode must be one of " + ", ".join(ec4_sysex.ENCODER_MODES))
     top = 31 if cfg["resolution"] == "14bit" else 127
@@ -135,6 +180,16 @@ class Bridge:
         self.cc_base = int(cfg["cc_base"])
         self.hi_res = cfg["resolution"] == "14bit"
         self.holdoff = cfg["feedback_holdoff_ms"] / 1000.0
+        self.my_setup = int(cfg["ec4_setup"]) - 1
+        self.cur_setup: int | None = None  # as reported by the EC4 (0-based); None = unknown
+        self.cur_group: int | None = None
+        self._overlay_timer: threading.Timer | None = None
+        self.hold = False  # True while this process itself is transferring a dump
+        self._list_page: int | None = None  # device list page on screen, None = closed
+        self._list_until = 0.0
+        self._list_held = False
+        self._rotate_timer: threading.Timer | None = None
+        self._was_paused = False
 
     # ---- layout ------------------------------------------------------------
     def update_from_params(self, params: list[Param]) -> bool:
@@ -178,16 +233,233 @@ class Bridge:
                 f.write(table + "\n")
         except OSError as exc:
             log.warning("could not write %s: %s", self.cfg["layout_txt"], exc)
+        first = not getattr(self, "_seen_layout", False)
+        self._seen_layout = True
         if os.path.exists(self.cfg["backup_syx"]):
             try:
                 write_layout_syx(self.cfg, self.layout)
-                log.info("EC4 names changed: run 'ec4bridge.py send-layout' to put them on the display")
+                if not self.cfg["live_names"]:
+                    log.info("EC4 names changed: run 'ec4bridge.py send-layout' to put them on the display")
             except Exception as exc:  # keep running even if the backup is bad
                 log.warning("could not build layout dump: %s", exc)
         self.resync()
+        self.write_names()
+        if not first and self.cfg["notify_graph_change"]:
+            self.notify(self._graph_summary())
+
+    # ---- EC4 setup/group state and live display --------------------------------
+    def on_my_setup(self) -> bool:
+        return self.cur_setup is None or self.cur_setup == self.my_setup
+
+    def on_sysex(self, msg: bytes):
+        rep = ec4_remote.parse_report(msg)
+        if not rep:
+            return
+        if "pressed" in rep and "setup" not in rep and "group" not in rep:
+            self._on_key(rep)
+            return
+        with self.lock:
+            was_mine = self.on_my_setup() and self.cur_setup is not None
+            old_group = self.cur_group
+            self.cur_setup = rep.get("setup", self.cur_setup)
+            self.cur_group = rep.get("group", self.cur_group)
+            mine = self.on_my_setup()
+        if mine and not was_mine:
+            log.info("EC4 is on the RNBO setup (%d), group %s", self.my_setup + 1,
+                     "?" if self.cur_group is None else self.cur_group + 1)
+            self.resync()
+            self.write_names()
+        elif mine and self.cur_group != old_group:
+            self.write_names()
+            list_was_open = self._list_page is not None
+            self._list_page = None
+            if old_group is not None and self.cfg["notify_group_change"] and self.cur_group is not None:
+                self.notify(self._group_summary(self.cur_group))
+            elif list_was_open:
+                self._hide_overlay()
+        elif was_mine and not mine:
+            log.info("EC4 switched to setup %d; pausing until it's back on setup %d",
+                     self.cur_setup + 1, self.my_setup + 1)
+
+    def paused(self) -> bool:
+        """True while a setup dump is going to/from the EC4 (send-layout / capture-backup).
+
+        Anything else sent to the EC4 during a dump (a value CC, a name update) lands inside
+        the SysEx stream and the EC4 rejects the whole dump with 'receive error'.
+        """
+        if self.hold:
+            return True
+        try:
+            return time.time() - os.path.getmtime(self.cfg["pause_file"]) < 600  # ignore stale files
+        except (OSError, KeyError):
+            return False
+
+    def _send_sysex(self, data: bytes):
+        if self.midi is not None and getattr(self.midi, "connected", True) and not self.paused():
+            self.midi.send_sysex(data)
+
+    def request_ec4_state(self):
+        self._send_sysex(ec4_remote.REQUEST_INFO)
+
+    def write_names(self):
+        """Put the current group's parameter names on the EC4 display (firmware 2.0+)."""
+        if not self.cfg["live_names"] or not self.on_my_setup():
+            return
+        with self.lock:
+            g = self.cur_group if self.cur_group is not None else 0
+            names = self.layout.encoder_names()[g] if 0 <= g < 16 else [None] * 16
+        self._send_sysex(ec4_remote.names_page(names))
+
+    def _graph_summary(self) -> list[str]:
+        from layout import strip_prefixes
+        prefixes = self.cfg.get("strip_prefixes") or []
+        seen, lines = set(), []
+        for s in self.layout.slots:
+            if s.param.inst in seen:
+                continue
+            seen.add(s.param.inst)
+            lines.append(f"{s.group + 1:>2} {strip_prefixes(s.param.inst_name, prefixes)}")
+        if not lines:
+            return ["RNBO graph loaded", "no parameters"]
+        if len(lines) > 3:
+            lines = lines[:2] + [f"   +{len(lines) - 2} more"]
+        return ["RNBO graph loaded"] + lines
+
+    def _group_summary(self, g: int) -> list[str]:
+        """Overlay text for a group: its instance's full name (group names can't be written live)."""
+        from layout import strip_prefixes
+        prefixes = self.cfg.get("strip_prefixes") or []
+        with self.lock:
+            in_group = [s for s in self.layout.slots if s.group == g]
+            if not in_group:
+                return [f"Group {g + 1}", "(no parameters)"]
+            inst = in_group[0].param.inst
+            name = strip_prefixes(in_group[0].param.inst_name, prefixes)
+            pages = sorted({s.group for s in self.layout.slots if s.param.inst == inst})
+        lines = [f"Group {g + 1}", name[:20]]
+        if len(pages) > 1:
+            lines.append(f"page {pages.index(g) + 1} of {len(pages)}")
+        return lines
+
+    def notify(self, lines: list[str], seconds: float | None = None):
+        """Show a short message on the EC4's 4x20 overlay."""
+        if not self.on_my_setup() or self.midi is None:
+            return
+        self._send_sysex(ec4_remote.overlay_text(lines))
+        self._send_sysex(ec4_remote.overlay_show(True))
+        if self._overlay_timer:
+            self._overlay_timer.cancel()
+        secs = float(self.cfg["notify_seconds"] if seconds is None else seconds)
+        self._overlay_timer = threading.Timer(secs, self._overlay_timeout)
+        self._overlay_timer.daemon = True
+        self._overlay_timer.start()
+
+    def _overlay_timeout(self):
+        self._list_page = None
+        self._list_held = False
+        if self._rotate_timer:
+            self._rotate_timer.cancel()
+        self._send_sysex(ec4_remote.overlay_show(False))
+
+    def _hide_overlay(self):
+        if self._overlay_timer:
+            self._overlay_timer.cancel()
+        self._overlay_timeout()
+
+    # ---- device list (SHIFT + push encoder 16 by default) ----------------------
+    def _is_list_key(self, rep: dict) -> bool:
+        key = parse_list_key(self.cfg.get("device_list_key", ""))
+        if key is None:
+            return False
+        kind, n = key
+        return (kind == "shift" and rep.get("shift_key") == n) or (kind == "user" and rep.get("user_key") == n)
+
+    def device_list_pages(self) -> list[list[str]]:
+        """Overlay pages listing 'group device' entries, 8 per page (2 columns x 4 rows)."""
+        from layout import strip_prefixes
+        prefixes = self.cfg.get("strip_prefixes") or []
+        with self.lock:
+            slots = list(self.layout.slots)
+        groups: dict[int, Slot] = {}
+        for s in slots:
+            groups.setdefault(s.group, s)
+        pages_of: dict[int, list[int]] = {}
+        for g, s in sorted(groups.items()):
+            pages_of.setdefault(s.param.inst, []).append(g)
+        entries = []
+        for g, s in sorted(groups.items()):
+            name = strip_prefixes(s.param.inst_name, prefixes)
+            own = pages_of[s.param.inst]
+            if len(own) > 1:
+                name = name[:6] + str(own.index(g) + 1)
+            entries.append(f"{g + 1:>2} {name[:7]:<7}")
+        if not entries:
+            return [["No devices loaded"]]
+        pages = []
+        for i in range(0, len(entries), 8):
+            chunk = entries[i:i + 8]
+            lines = ["".join(chunk[j:j + 2]) for j in range(0, len(chunk), 2)]
+            pages.append(lines)
+        return pages
+
+    def _on_key(self, rep: dict):
+        """Key events from the EC4: open/close the device list."""
+        is_list_key = self._is_list_key(rep)
+        momentary = self.cfg.get("device_list_mode", "momentary") == "momentary"
+        if rep["pressed"]:
+            if is_list_key and self.on_my_setup():
+                if momentary:
+                    self.hold_device_list()
+                else:
+                    self.toggle_device_list()
+        elif momentary and self._list_held and (is_list_key or rep.get("shift")):
+            # released the push button, or let go of SHIFT first
+            self._hide_overlay()
+
+    def hold_device_list(self):
+        """Momentary: show the list while the key is held; pages flip by themselves."""
+        self._list_held = True
+        self._show_list_page(0)
+
+    def _show_list_page(self, page: int):
+        pages = self.device_list_pages()
+        page %= len(pages)
+        # the timeout is only a safety net in case the release never arrives
+        self.notify(pages[page], seconds=float(self.cfg["device_list_seconds"]))
+        self._list_page = page
+        self._list_held = True
+        if self._rotate_timer:
+            self._rotate_timer.cancel()
+        if len(pages) > 1:
+            self._rotate_timer = threading.Timer(float(self.cfg["device_list_page_seconds"]),
+                                                 self._rotate_list)
+            self._rotate_timer.daemon = True
+            self._rotate_timer.start()
+
+    def _rotate_list(self):
+        if self._list_held and self._list_page is not None:
+            self._show_list_page(self._list_page + 1)
+
+    def toggle_device_list(self):
+        """First press shows the list, further presses page through it, then close it."""
+        pages = self.device_list_pages()
+        now = time.monotonic()
+        if self._list_page is not None and now < self._list_until:
+            nxt = self._list_page + 1
+            if nxt >= len(pages):
+                self._hide_overlay()
+                return
+        else:
+            nxt = 0
+        secs = float(self.cfg["device_list_seconds"])
+        self.notify(pages[nxt], seconds=secs)
+        self._list_page = nxt
+        self._list_until = now + secs
 
     # ---- EC4 -> runner -----------------------------------------------------
     def on_cc(self, channel: int, cc: int, value: int):
+        if not self.on_my_setup() or self.paused():
+            return  # the EC4 is on one of your other setups
         if self.hi_res:
             if self.cc_base <= cc < self.cc_base + 16:
                 self.msb[(channel, cc)] = value
@@ -233,26 +505,37 @@ class Bridge:
             self._feedback(slot, v)
 
     def _cc_messages(self, slot: Slot, v: float) -> list[tuple[int, int, int]]:
+        return self._encoder_ccs(slot.group, slot.encoder, v)
+
+    def _encoder_ccs(self, group: int, encoder: int, v: float) -> list[tuple[int, int, int]]:
         v = min(1.0, max(0.0, v))
-        cc = self.cc_base + slot.encoder
+        cc = self.cc_base + encoder
         if self.hi_res:
             x = round(v * 16383)
-            return [(slot.group, cc, x >> 7), (slot.group, cc + 32, x & 0x7F)]
-        return [(slot.group, cc, round(v * 127))]
+            return [(group, cc, x >> 7), (group, cc + 32, x & 0x7F)]
+        return [(group, cc, round(v * 127))]
 
     def _feedback(self, slot: Slot, v: float):
-        if self.midi is None:
+        if self.midi is None or not self.on_my_setup() or self.paused():
             return
         self.midi.send_ccs(self._cc_messages(slot, v), pause=0)
 
     def resync(self):
         """Send every current value to the EC4."""
-        if self.midi is None or not getattr(self.midi, "connected", True):
+        if (self.midi is None or not getattr(self.midi, "connected", True)
+                or not self.on_my_setup() or self.paused()):
             return
         with self.lock:
             msgs = []
             for s in self.layout.slots:
                 msgs += self._cc_messages(s, self.values.get(s.param.key, s.param.normalized))
+            if self.cfg.get("zero_unused", True):
+                # encoders with no parameter (e.g. left over from the previous graph) go to 0
+                used = {(s.group, s.encoder) for s in self.layout.slots}
+                for g in range(16):
+                    for e in range(16):
+                        if (g, e) not in used:
+                            msgs += self._encoder_ccs(g, e, 0.0)
         self.midi.send_ccs(msgs)
 
 
@@ -264,7 +547,8 @@ def write_layout_syx(cfg: dict, layout: Layout) -> bytes:
     ec4_sysex.apply_layout(
         dump, int(cfg["ec4_setup"]) - 1, cfg["setup_name"], layout.group_names, layout.encoder_names(),
         cc_base=int(cfg["cc_base"]), resolution=cfg["resolution"], mode=cfg["encoder_mode"],
-        display=cfg["display"] or None,
+        display=cfg["display"] or None, live_names=bool(cfg["live_names"]),
+        push_jumps=bool(cfg["push_jumps_to_group"]),
     )
     data = ec4_sysex.build_dump(dump)
     tmp = cfg["layout_syx"] + ".tmp"
@@ -292,7 +576,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
 
     client = SimpleUDPClient(cfg["runner_host"], int(cfg["osc_port"]))
     bridge = Bridge(cfg, osc_send=lambda a, v: client.send_message(a, v))
-    midi = open_midi(cfg, on_cc=bridge.on_cc)
+    midi = open_midi(cfg, on_cc=bridge.on_cc, on_sysex=bridge.on_sysex)
     bridge.midi = midi
 
     disp = Dispatcher()
@@ -309,12 +593,16 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     runner_ok = False
+    last_refresh = time.monotonic()
     log.info("bridge started; runner %s, EC4 match '%s', setup %s, %s",
              cfg["runner_host"], cfg["midi_port"], cfg["ec4_setup"], cfg["resolution"])
     while not stop.is_set():
         reconnected = False
         try:
             reconnected = midi.ensure_connected()
+            if reconnected:
+                bridge.cur_setup = bridge.cur_group = None
+                bridge.request_ec4_state()  # the EC4 answers with its setup and group
         except Exception as exc:
             log.warning("MIDI port scan failed: %s", exc)
         try:
@@ -326,6 +614,22 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
             changed = bridge.update_from_params(params)
             if reconnected and not changed:
                 bridge.resync()
+                bridge.write_names()
+            if bridge.paused():
+                if not bridge._was_paused:
+                    log.info("setup dump in progress; not sending anything to the EC4")
+                bridge._was_paused = True
+            elif bridge._was_paused:
+                bridge._was_paused = False
+                log.info("setup dump finished; resending values and names")
+                bridge.cur_setup = bridge.cur_group = None
+                bridge.request_ec4_state()
+                bridge.resync()
+                bridge.write_names()
+            refresh = float(cfg["live_names_refresh"] or 0)
+            if refresh and time.monotonic() - last_refresh >= refresh:
+                last_refresh = time.monotonic()
+                bridge.write_names()
         except (urllib.error.URLError, OSError, ValueError) as exc:
             if runner_ok:
                 log.warning("runner not reachable: %s", exc)
@@ -359,6 +663,31 @@ def cmd_list(cfg: dict, args) -> int:
     return 0
 
 
+class pause_bridge:
+    """Context manager: tell a running bridge service to stay quiet during a dump."""
+
+    def __init__(self, cfg: dict, settle: float = 0.5):
+        self.path = cfg["pause_file"]
+        self.settle = settle
+
+    def __enter__(self):
+        try:
+            with open(self.path, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError as exc:
+            print(f"Warning: could not pause the bridge service ({exc}).")
+            print("If it's running, stop it first: sudo systemctl stop ec4bridge")
+        time.sleep(self.settle)  # let anything already on its way to the EC4 go out first
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+        return False
+
+
 def _capture(cfg: dict, timeout: float) -> bytes | None:
     q: queue.Queue[bytes] = queue.Queue()
     midi = open_midi(cfg, on_sysex=q.put)
@@ -386,7 +715,8 @@ def _capture(cfg: dict, timeout: float) -> bytes | None:
 
 
 def cmd_capture_backup(cfg: dict, args) -> int:
-    msg = _capture(cfg, args.timeout)
+    with pause_bridge(cfg):
+        msg = _capture(cfg, args.timeout)
     if msg is None:
         return 1
     try:
@@ -443,13 +773,21 @@ def cmd_send_layout(cfg: dict, args) -> int:
     print(f"\nThis overwrites ALL 16 setups on the EC4: setup {cfg['ec4_setup']} gets the RNBO layout,"
           f"\nthe others are restored from the backup taken {age / 3600:.1f} h ago.")
     print("On the EC4: open the 'Receive' menu; the display shows 'Work in progress'.")
+    with pause_bridge(cfg):  # a running service must not talk to the EC4 during the dump
+        return _send_layout(cfg, args, data)
+
+
+def _send_layout(cfg: dict, args, data: bytes) -> int:
     if not args.yes:
         try:
             input("Press Enter when the EC4 is waiting to receive (Ctrl-C to cancel) ")
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             return 1
-    midi = open_midi(cfg)
+    bridge = Bridge(cfg)
+    bridge.hold = True  # stay silent until the dump is out
+    midi = open_midi(cfg, on_sysex=bridge.on_sysex)
+    bridge.midi = midi
     try:
         midi.ensure_connected()
         if not midi.connected:
@@ -464,9 +802,84 @@ def cmd_send_layout(cfg: dict, args) -> int:
         midi.send_sysex_chunks(chunks, pause, progress)
         print("\nDone. The EC4 shows the progress and returns to normal when finished.")
         time.sleep(3)
-        bridge = Bridge(cfg, midi=midi)
-        bridge.update_from_params(fetch_params(cfg))  # also sends all current values
-        print("Sent current parameter values to the EC4.")
+        bridge.hold = False
+        bridge.cfg = dict(cfg, pause_file="")  # our own pause file is still there; ignore it
+        bridge.request_ec4_state()  # so names only go to the screen if the RNBO setup is showing
+        time.sleep(1)
+        bridge.update_from_params(fetch_params(cfg))  # sends all current values and live names
+        if cfg["live_names"]:
+            print("Sent current values and names to the EC4. Encoder names are stored as '----'")
+            print("so the bridge can write them live; select the RNBO setup to see them.")
+        else:
+            print("Sent current parameter values to the EC4.")
+    finally:
+        midi.close()
+    return 0
+
+
+def cmd_test_display(cfg: dict, args) -> int:
+    """Check that the EC4 answers state requests and shows live display text."""
+    q: queue.Queue[dict] = queue.Queue()
+
+    def on_sysex(msg):
+        rep = ec4_remote.parse_report(msg)
+        if rep:
+            q.put(rep)
+
+    def ask(timeout=2.0) -> dict | None:
+        while not q.empty():
+            q.get_nowait()
+        midi.send_sysex(ec4_remote.REQUEST_INFO)
+        state: dict = {}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                state.update(q.get(timeout=0.2))
+            except queue.Empty:
+                if state:
+                    break
+        return state or None
+
+    def fmt(st):
+        return (f"setup {st['setup'] + 1 if 'setup' in st else '?'}, "
+                f"group {st['group'] + 1 if 'group' in st else '?'}")
+
+    midi = open_midi(cfg, on_sysex=on_sysex)
+    try:
+        midi.ensure_connected()
+        if not midi.connected:
+            print(f"No MIDI port matching '{cfg['midi_port']}' found.")
+            return 1
+        print("1) Asking the EC4 which setup and group it is on ...")
+        before = ask()
+        if not before:
+            print("   No answer. Remote commands need EC4 firmware 2.0 or newer; live names won't work.")
+            return 1
+        print(f"   EC4 reports {fmt(before)}  -> state reports work")
+
+        print("2) Writing a test message on the EC4 display for 4 seconds ...")
+        midi.send_sysex(ec4_remote.overlay_text(["ec4bridge", "live display test", "", "can you read this?"]))
+        midi.send_sysex(ec4_remote.overlay_show(True))
+        time.sleep(4)
+        midi.send_sysex(ec4_remote.overlay_show(False))
+        print("   If you saw the text, live display text works.")
+
+        print("3) Writing test names (T01 ... T16) on the encoder names for 4 seconds ...")
+        midi.send_sysex(ec4_remote.names_page([f"T{e + 1:02d}" for e in range(16)]))
+        time.sleep(4)
+        names: list = [None] * 16
+        try:  # put the real names back for the group that's showing
+            lay = build_layout(fetch_params(cfg), cfg)
+            names = lay.encoder_names()[before.get("group", 0)]
+        except Exception:
+            pass
+        midi.send_sysex(ec4_remote.names_page(names))
+        print("   T01..T16 appeared  -> live names work.")
+        print("   Old names stayed   -> the encoder names stored in this setup aren't '----'.")
+        print("                         Run 'send-layout' once (with live_names on) to fix that.")
+        if before.get("setup") != int(cfg["ec4_setup"]) - 1:
+            print(f"   Note: the EC4 is on setup {before.get('setup', -1) + 1}; the bridge writes names only"
+                  f" while it's on setup {cfg['ec4_setup']} (the RNBO setup).")
     finally:
         midi.close()
     return 0
@@ -487,6 +900,7 @@ def main(argv=None) -> int:
     p.add_argument("--yes", action="store_true", help="don't wait for Enter")
     p.add_argument("--fresh-backup", action="store_true", help="capture a new backup first")
     p.add_argument("--timeout", type=float, default=120)
+    sub.add_parser("test-display", help="check live display text on the EC4")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -494,7 +908,7 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
     return {
         "run": cmd_run, "list": cmd_list, "capture-backup": cmd_capture_backup,
-        "make-syx": cmd_make_syx, "send-layout": cmd_send_layout,
+        "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display,
     }[args.cmd](cfg, args)
 
 

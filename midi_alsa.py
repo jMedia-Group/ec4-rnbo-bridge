@@ -103,6 +103,15 @@ class EC4Midi:
             if pause:
                 time.sleep(pause)
 
+    def send_sysex(self, data: bytes):
+        """Send one (short) SysEx message."""
+        if not self._device:
+            return
+        with self._out_lock:
+            for j in range(0, len(data), 256):
+                self._out.event_output(SysExEvent(bytes(data[j:j + 256])), port=self._out_port)
+            self._out.drain_output()
+
     def send_sysex_chunks(self, chunks: list[bytes], pause: float, progress=None):
         """Send one long SysEx message as consecutive fragments."""
         if not self._device:
