@@ -120,6 +120,11 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, or a
 "large step" mode, so a full sweep doesn't take many turns.
 
+## Commands
+
+sudo systemctl restart ec4bridge
+venv/bin/python ec4bridge.py send-layout
+
 ## Troubleshooting
 
 - `No MIDI port matching 'EC4'`: run `aconnect -l` and put part of the EC4's name in `midi_port`.
