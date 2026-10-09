@@ -74,6 +74,8 @@ DEFAULTS = {
     "push_jumps_to_group": True,
     "device_list_key": "shift+16",
     "device_list_seconds": 8,
+    "device_list_mode": "momentary",
+    "device_list_page_seconds": 2,
 }
 
 
@@ -128,6 +130,9 @@ def load_config(path: str | None) -> dict:
     key = cfg["device_list_key"] = str(cfg["device_list_key"] or "off").strip().lower().replace(" ", "")
     if parse_list_key(key) is None and key != "off":
         raise SystemExit('device_list_key must be "shift+1".."shift+16", "user1".."user4" or "off"')
+    cfg["device_list_mode"] = str(cfg["device_list_mode"] or "momentary").strip().lower()
+    if cfg["device_list_mode"] not in ("momentary", "toggle"):
+        raise SystemExit('device_list_mode must be "momentary" or "toggle"')
     from layout import GROUP_TITLE_STYLES
     cfg["group_title_style"] = str(cfg["group_title_style"] or "instance").strip().lower()
     if cfg["group_title_style"] not in GROUP_TITLE_STYLES:
@@ -181,6 +186,8 @@ class Bridge:
         self.hold = False  # True while this process itself is transferring a dump
         self._list_page: int | None = None  # device list page on screen, None = closed
         self._list_until = 0.0
+        self._list_held = False
+        self._rotate_timer: threading.Timer | None = None
         self._was_paused = False
 
     # ---- layout ------------------------------------------------------------
@@ -247,9 +254,8 @@ class Bridge:
         rep = ec4_remote.parse_report(msg)
         if not rep:
             return
-        if rep.get("pressed") and self._is_list_key(rep):
-            if self.on_my_setup():
-                self.toggle_device_list()
+        if "pressed" in rep and "setup" not in rep and "group" not in rep:
+            self._on_key(rep)
             return
         with self.lock:
             was_mine = self.on_my_setup() and self.cur_setup is not None
@@ -349,6 +355,9 @@ class Bridge:
 
     def _overlay_timeout(self):
         self._list_page = None
+        self._list_held = False
+        if self._rotate_timer:
+            self._rotate_timer.cancel()
         self._send_sysex(ec4_remote.overlay_show(False))
 
     def _hide_overlay(self):
@@ -391,6 +400,44 @@ class Bridge:
             lines = ["".join(chunk[j:j + 2]) for j in range(0, len(chunk), 2)]
             pages.append(lines)
         return pages
+
+    def _on_key(self, rep: dict):
+        """Key events from the EC4: open/close the device list."""
+        is_list_key = self._is_list_key(rep)
+        momentary = self.cfg.get("device_list_mode", "momentary") == "momentary"
+        if rep["pressed"]:
+            if is_list_key and self.on_my_setup():
+                if momentary:
+                    self.hold_device_list()
+                else:
+                    self.toggle_device_list()
+        elif momentary and self._list_held and (is_list_key or rep.get("shift")):
+            # released the push button, or let go of SHIFT first
+            self._hide_overlay()
+
+    def hold_device_list(self):
+        """Momentary: show the list while the key is held; pages flip by themselves."""
+        self._list_held = True
+        self._show_list_page(0)
+
+    def _show_list_page(self, page: int):
+        pages = self.device_list_pages()
+        page %= len(pages)
+        # the timeout is only a safety net in case the release never arrives
+        self.notify(pages[page], seconds=float(self.cfg["device_list_seconds"]))
+        self._list_page = page
+        self._list_held = True
+        if self._rotate_timer:
+            self._rotate_timer.cancel()
+        if len(pages) > 1:
+            self._rotate_timer = threading.Timer(float(self.cfg["device_list_page_seconds"]),
+                                                 self._rotate_list)
+            self._rotate_timer.daemon = True
+            self._rotate_timer.start()
+
+    def _rotate_list(self):
+        if self._list_held and self._list_page is not None:
+            self._show_list_page(self._list_page + 1)
 
     def toggle_device_list(self):
         """First press shows the list, further presses page through it, then close it."""

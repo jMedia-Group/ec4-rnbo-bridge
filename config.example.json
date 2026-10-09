@@ -35,6 +35,8 @@
   "push_jumps_to_group": true,
   "device_list_key": "shift+16",
   "device_list_seconds": 8,
+  "device_list_mode": "momentary",
+  "device_list_page_seconds": 2,
   "live_names_refresh": 0,
 
   "backup_syx": "ec4-backup.syx",

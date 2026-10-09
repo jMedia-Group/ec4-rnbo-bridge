@@ -106,9 +106,11 @@ names for 4 seconds. If the test names don't appear, the stored names aren't `--
 
 ### Device list and jumping to a group
 
-- **SHIFT + push encoder 16** pops up a list of the loaded devices with their group numbers,
-  e.g. ` 1 Synth1  2 Synth2` / ` 3 Delay`. With more than 8 groups in use, press it again for
-  the next page; once more closes it (it also closes by itself after `device_list_seconds`).
+- **Hold SHIFT + push encoder 16** to see a list of the loaded devices with their group numbers,
+  e.g. ` 1 Synth1  2 Synth2` / ` 3 Delay`. It disappears when you let go. With more than 8 groups
+  in use, the pages flip every `device_list_page_seconds` while you hold.
+  (`"device_list_mode": "toggle"` makes it press-to-open instead: press again for the next page,
+  once more to close.)
 - **Push encoder N** to jump to group N. This uses the EC4's own "Grp" push-button type, which
   `send-layout` programs into the RNBO setup (`push_jumps_to_group`), so run `send-layout` once.
   After the jump, the new group's names appear and the pop-up shows which device you're on.
@@ -161,7 +163,9 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `notify_seconds` | 2.5 | how long that message stays |
 | `push_jumps_to_group` | `true` | encoder N's push button jumps to group N (needs `send-layout`); `false` = pushes off |
 | `device_list_key` | `shift+16` | key that shows the device list: `shift+1`…`shift+16`, `user1`…`user4` (FUNC + encoder 1/5/9/13), or `off` |
-| `device_list_seconds` | 8 | how long the device list stays up |
+| `device_list_mode` | `momentary` | `momentary`: list shows while held; `toggle`: press to open, again to page/close |
+| `device_list_page_seconds` | 2 | momentary mode: how fast pages flip while held (more than 8 groups) |
+| `device_list_seconds` | 8 | toggle mode: how long the list stays up; momentary mode: safety timeout |
 | `notify_group_change` | `true` | pop up the instance name when you switch groups |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |

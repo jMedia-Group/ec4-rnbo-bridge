@@ -90,6 +90,7 @@ class SysexTests(unittest.TestCase):
         allowed = set(range(sx.ADDR_SETUP_NAMES + 60, sx.ADDR_SETUP_NAMES + 64))
         allowed |= set(range(sx.ADDR_GROUP_NAMES + 15 * 64, sx.ADDR_GROUP_NAMES + 16 * 64))
         allowed |= set(range(sx._group_base(15, 0), sx._group_base(15, 0) + 16 * 192))
+        allowed |= {sx.ADDR_KEY2 + (15 * 16 + g) * 32 + e for g in range(16) for e in range(16)}
         self.assertTrue(set(changed) <= allowed)
         # and the result is still a valid dump
         sx.parse_dump(sx.build_dump(d))
@@ -133,6 +134,21 @@ class SysexTests(unittest.TestCase):
         sx.apply_layout(d, 15, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1")
         b = sx._group_base(15, 9)
         self.assertEqual({d.memory[b + 112 + e] for e in range(16)}, {0x09})  # off
+
+    def test_push_star_switched_off(self):
+        d = synthetic_dump()
+        k2 = sx.ADDR_KEY2
+        for i in range(16 * 16 * 32):  # every push button: star on, lower value 0x6c
+            d.memory[k2 + i] = 0xEC
+        before = bytes(d.memory)
+        names = [[None] * 16 for _ in range(16)]
+        sx.apply_layout(d, 15, "R", [], names, cc_base=16, resolution="7bit", mode="Acc1", push_jumps=True)
+        for g in (0, 15):
+            a = k2 + (15 * 16 + g) * 32
+            self.assertEqual(set(d.memory[a:a + 16]), {0x6C})  # star off, lower value kept
+            self.assertEqual(set(d.memory[a + 16:a + 32]), {0xEC})  # link/upper bytes untouched
+        a = k2 + (3 * 16) * 32
+        self.assertEqual(d.memory[a:a + 512], before[a:a + 512])  # other setups untouched
 
     def test_14bit_limits(self):
         d = synthetic_dump()
@@ -595,7 +611,7 @@ class LiveDisplayTests(unittest.TestCase):
         return [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
 
     def test_device_list_popup(self):
-        b = self.make(notify_group_change=True)
+        b = self.make(notify_group_change=True, device_list_mode="toggle")
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
         b.on_sysex(key_press(shift_key=15))  # SHIFT + push encoder 16
@@ -633,7 +649,7 @@ class LiveDisplayTests(unittest.TestCase):
         tree = {"CONTENTS": {str(i): make_instance(i, f"dev{i}", [("p", 0, 0.5)]) for i in range(10)}}
         self.midi = FakeMidi()
         b = Bridge(cfg(layout_txt=os.path.join(self.tmp.name, "l.txt"), backup_syx="none",
-                       device_list_key="user1"), midi=self.midi)
+                       device_list_key="user1", device_list_mode="toggle"), midi=self.midi)
         b.update_from_params(parse_params(tree))
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
@@ -648,6 +664,45 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_sysex(key_press(user_key=1))  # past the last page -> closed
         self.assertIsNone(b._list_page)
         b._hide_overlay()
+
+    def test_device_list_momentary(self):
+        b = self.make()  # default: momentary
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))  # hold SHIFT + push 16
+        self.assertEqual(self.overlays()[0][:20], " 1 polysy1 2 polysy2")
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        b.on_sysex(key_press(shift_key=15, pressed=False))  # let go
+        self.assertEqual(self.midi.sysex[-1], rm.overlay_show(False))
+        self.assertIsNone(b._list_page)
+        # letting go of SHIFT first also closes it
+        b.on_sysex(key_press(shift_key=15))
+        self.midi.sysex.clear()
+        b.on_sysex(bytes([*rm.HEADER, 0x4E, 0x26, 0x11, 0x4E, 0x2E, 0x10, 0xF7]))
+        self.assertEqual(self.midi.sysex, [rm.overlay_show(False)])
+        # a release with no list open sends nothing
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15, pressed=False))
+        self.assertEqual(self.midi.sysex, [])
+
+    def test_device_list_momentary_pages_flip(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {str(i): make_instance(i, f"dev{i}", [("p", 0, 0.5)]) for i in range(10)}}
+        self.midi = FakeMidi()
+        b = Bridge(cfg(layout_txt=os.path.join(self.tmp.name, "l.txt"), backup_syx="none",
+                       device_list_page_seconds=0.05), midi=self.midi)
+        b.update_from_params(parse_params(tree))
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(key_press(shift_key=15))
+        time.sleep(0.08)
+        ov = self.overlays()
+        self.assertTrue(ov[0].startswith(" 1 dev0"))
+        self.assertTrue(ov[1].startswith(" 9 dev8"))
+        b.on_sysex(key_press(shift_key=15, pressed=False))
+        n = len(self.overlays())
+        time.sleep(0.12)
+        self.assertEqual(len(self.overlays()), n)  # stopped flipping after release
 
     def test_live_names_off(self):
         self.make(live_names=False, notify_graph_change=False)

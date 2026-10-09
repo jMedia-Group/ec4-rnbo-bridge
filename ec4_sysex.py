@@ -27,6 +27,7 @@ ADDR_SETUP_NAMES = 0x1BC0 - MEMORY_OFFSET
 ADDR_GROUP_NAMES = 0x1C00 - MEMORY_OFFSET
 ADDR_SETUP_DATA = 0x2000 - MEMORY_OFFSET
 GROUP_LEN = 192  # bytes per group in the setup data area
+ADDR_KEY2 = 0xE000 - MEMORY_OFFSET  # push buttons: display flag (bit 7) + lower value, 32 bytes/group
 
 # encoder field offsets inside a group block (each field is 16 bytes, one per encoder)
 F_TYPE_CHANNEL = 0
@@ -211,7 +212,7 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
     encoder: the EC4 only accepts names written live over SysEx on encoders named '----'
     (EC4 manual V03), and which encoders are in use changes with every graph.
     push_jumps=True makes encoder N's push button jump to group N (the EC4's own "Grp" type);
-    otherwise push buttons are off.
+    otherwise push buttons are off. Either way the push-button status star (*) is switched off.
     """
     if not 0 <= setup < 16:
         raise ValueError("setup must be 0..15")
@@ -258,6 +259,9 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
                 m[base + F_PB_TYPE_CHANNEL + e] = (PB_TYPE_GROUP << 4) | e
             else:
                 m[base + F_PB_TYPE_CHANNEL + e] = (PB_TYPE_OFF << 4) | g
+            # no '*' next to names/values: clear the push button's display flag, keep its lower value
+            k2 = ADDR_KEY2 + (setup * 16 + g) * 32 + e
+            m[k2] &= 0x7F
             a = base + F_NAMES + e * 4
             stored = LIVE_NAME_PLACEHOLDER if live_names else (name or "")
             m[a:a + 4] = clean_name(stored).encode("latin-1")
