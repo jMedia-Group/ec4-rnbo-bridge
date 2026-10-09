@@ -13,6 +13,7 @@ Subcommands:
   make-syx         write an EC4 dump with the current layout and names
   send-layout      make the dump and send it to the EC4 (EC4 must be in Receive)
   test-display     check that the EC4 accepts live display text (firmware 2.0+)
+  monitor          show what the EC4 sends as you turn encoders (timing, skipped steps)
 """
 
 from __future__ import annotations
@@ -192,6 +193,7 @@ class Bridge:
         self._list_held = False
         self._rotate_timer: threading.Timer | None = None
         self.by_raw: dict[str, Slot] = {}
+        self._polled: dict[str, float] = {}  # normalized values seen in the last poll
         self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
         self._popup_pending: tuple[Slot, object] | None = None
         self._popup_last = 0.0
@@ -218,16 +220,21 @@ class Bridge:
                 self.raw = {s.param.key: s.param.value for s in layout.slots}
                 self.msb.clear()
             else:
-                # catch value changes the OSC listener might have missed
+                # catch value changes the OSC listener might have missed. Only trust a polled
+                # value once it's the same in two polls in a row: a snapshot taken while a knob
+                # is moving can be older than what the EC4 already shows.
                 now = time.monotonic()
                 for s in layout.slots:
                     k = s.param.key
+                    prev, self._polled[k] = self._polled.get(k), s.param.normalized
                     if s.param.value is not None and now - self.touched.get(k, 0) >= 1.0:
                         self.raw[k] = s.param.value
                     old = self.values.get(k)
                     if old is None or abs(old - s.param.normalized) < 1e-6:
                         continue
-                    if now - self.touched.get(k, 0) < max(self.holdoff, 1.0):
+                    if prev is None or abs(prev - s.param.normalized) > 1e-6:
+                        continue  # still changing (or first look): wait for the next poll
+                    if now - self.touched.get(k, 0) < max(self.holdoff, 1.0) + float(self.cfg["poll_interval"]):
                         continue
                     self.values[k] = s.param.normalized
                     self._feedback(self.by_addr[s.param.address], s.param.normalized)
@@ -922,6 +929,43 @@ def _send_layout(cfg: dict, args, data: bytes) -> int:
     return 0
 
 
+def cmd_monitor(cfg: dict, args) -> int:
+    """Print what the EC4 sends, with timing, to see whether values arrive late or skip."""
+    cc_base = int(cfg["cc_base"])
+    last: dict[tuple[int, int], tuple[float, int]] = {}
+    t0 = time.monotonic()
+
+    def on_cc(ch, cc, val):
+        now = time.monotonic()
+        prev = last.get((ch, cc))
+        last[(ch, cc)] = (now, val)
+        enc = cc - cc_base + 1 if cc_base <= cc < cc_base + 16 else None
+        where = f"group {ch + 1:>2} enc {enc:>2}" if enc else f"ch {ch + 1:>2} cc {cc:>3}"
+        if prev:
+            dt = (now - prev[0]) * 1000
+            step = val - prev[1]
+            flag = "  <-- skipped" if abs(step) > 1 and dt < 300 else ""
+            print(f"{now - t0:8.3f}s  {where}  value {val:>3}  step {step:+3d}  {dt:6.1f} ms{flag}", flush=True)
+        else:
+            print(f"{now - t0:8.3f}s  {where}  value {val:>3}", flush=True)
+
+    midi = open_midi(cfg, on_cc=on_cc)
+    try:
+        midi.ensure_connected()
+        if not midi.connected:
+            print(f"No MIDI port matching '{cfg['midi_port']}' found.")
+            return 1
+        print("Turn encoders slowly, then quickly. Ctrl-C to stop.")
+        print("'step' is the change since the previous message; 'ms' the time since it.")
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        midi.close()
+    return 0
+
+
 def cmd_test_display(cfg: dict, args) -> int:
     """Check that the EC4 answers state requests and shows live display text."""
     q: queue.Queue[dict] = queue.Queue()
@@ -1006,6 +1050,7 @@ def main(argv=None) -> int:
     p.add_argument("--fresh-backup", action="store_true", help="capture a new backup first")
     p.add_argument("--timeout", type=float, default=120)
     sub.add_parser("test-display", help="check live display text on the EC4")
+    sub.add_parser("monitor", help="show what the EC4 sends, with timing")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1013,7 +1058,7 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
     return {
         "run": cmd_run, "list": cmd_list, "capture-backup": cmd_capture_backup,
-        "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display,
+        "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display, "monitor": cmd_monitor,
     }[args.cmd](cfg, args)
 
 

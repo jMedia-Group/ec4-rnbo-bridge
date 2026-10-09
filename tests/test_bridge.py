@@ -348,6 +348,18 @@ class BridgeTests(unittest.TestCase):
         b.on_osc("/rnbo/inst/1/params/mix/normalized", 20 / 127)
         self.assertEqual(self.midi.sent, [])  # the knob is not pulled back
 
+    def test_poll_never_pulls_back_a_turned_knob(self):
+        b = self.make(poll_interval=0.0)
+        tree = default_tree()
+        node = tree["CONTENTS"]["1"]["CONTENTS"]["params"]["CONTENTS"]["mix"]["CONTENTS"]["normalized"]
+        node["VALUE"] = [0.3]
+        b.update_from_params(parse_params(tree))
+        b.on_cc(2, 18, 120)  # user turns mix up; snapshots still say 0.3 for a while
+        self.midi.sent.clear()
+        b.update_from_params(parse_params(tree))
+        b.update_from_params(parse_params(tree))
+        self.assertEqual(self.midi.sent, [])
+
     def test_feedback_and_holdoff(self):
         b = self.make()
         self.midi.sent.clear()
@@ -379,6 +391,8 @@ class BridgeTests(unittest.TestCase):
         tree["CONTENTS"]["1"]["CONTENTS"]["params"]["CONTENTS"]["mix"]["CONTENTS"]["normalized"]["VALUE"] = [1.0]
         changed = b.update_from_params(parse_params(tree))
         self.assertFalse(changed)
+        self.assertEqual(self.midi.sent, [])  # seen once: could be a snapshot mid-change
+        b.update_from_params(parse_params(tree))  # same value in the next poll -> trust it
         self.assertEqual(self.midi.sent, [(2, 18, 127)])
 
     def test_osc_over_udp(self):
@@ -481,6 +495,10 @@ class RunLoopTest(unittest.TestCase):
                 stop.set()
                 t.join(timeout=5)
                 ec4bridge.open_midi = orig
+                for _ in range(50):  # the last UDP message may still be in flight
+                    if any(a == "/rnbo/listeners/del" for a, _ in got):
+                        break
+                    time.sleep(0.02)
                 osc_in.shutdown()
                 osc_in.server_close()
                 runner.close()

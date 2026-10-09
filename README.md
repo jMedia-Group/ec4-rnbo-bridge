@@ -196,10 +196,15 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
 
 ## Troubleshooting
 
-- **Knobs jump or stutter**: make sure `feedback_holdoff_ms` is at least 1000 (older example
-  configs had 250). If the EC4's own value display flashes over the pop-up, turn it off on the
-  EC4 with SHIFT + NAME, or set `"value_popup": false` to compare. Check the log for "MIDI output
-  error".
+- **Knobs lag, jump or skip steps**:
+  1. In the RNBO web interface, make sure the EC4 isn't also controlling the patch directly:
+     remove its connection to instances in the Graph view and delete any MIDI mappings that use
+     its CCs (MIDI Mappings view). Two paths to the same parameter fight each other.
+  2. Run `venv/bin/python ec4bridge.py monitor` and turn a knob slowly. Steps of more than 1
+     mean the EC4 itself is skipping: that's acceleration, set `"encoder_mode": "Acc0"` and run
+     `send-layout`. For finer control use `"resolution": "14bit"` (plus `send-layout`).
+  3. Make sure `feedback_holdoff_ms` is at least 1000 (older example configs had 250).
+  4. Close the RNBO web interface in your browser while playing; it adds load on the Pi.
 
 - **"Receive error" on the EC4 during `send-layout`**: something else reached the EC4 in the middle
   of the dump. `send-layout` and `capture-backup` pause a running bridge service automatically
