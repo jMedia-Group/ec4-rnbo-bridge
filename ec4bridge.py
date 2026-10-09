@@ -13,6 +13,7 @@ Subcommands:
   make-syx         write an EC4 dump with the current layout and names
   send-layout      make the dump and send it to the EC4 (EC4 must be in Receive)
   test-display     check that the EC4 accepts live display text (firmware 2.0+)
+  monitor          show what the EC4 sends as you turn encoders (timing, skipped steps)
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ DEFAULTS = {
     "display": "",
     "cc_base": 16,
     "poll_interval": 2.0,
-    "feedback_holdoff_ms": 250,
+    "feedback_holdoff_ms": 1000,
     "new_group_per_instance": True,
     "include": [],
     "exclude": [],
@@ -69,6 +70,9 @@ DEFAULTS = {
     "live_names": True,
     "live_names_refresh": 0,
     "zero_unused": True,
+    "value_popup": True,
+    "value_popup_seconds": 1.5,
+    "units": {},
     "notify_graph_change": True,
     "notify_seconds": 2.5,
     "notify_group_change": True,
@@ -189,6 +193,16 @@ class Bridge:
         self._list_until = 0.0
         self._list_held = False
         self._rotate_timer: threading.Timer | None = None
+        self.by_raw: dict[str, Slot] = {}
+        self._polled: dict[str, float] = {}  # normalized values seen in the last poll
+        self._sent_cc: dict[tuple[int, int], tuple[int, float]] = {}  # what we last sent the EC4
+        self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
+        self._popup_pending: tuple[Slot, object] | None = None
+        self._popup_last = 0.0
+        self._popup_timer: threading.Timer | None = None
+        self._overlay_visible = False
+        self._overlay_owner = None
+        self._overlay_lines: list[str] = [""] * 4
         self._was_paused = False
 
     # ---- layout ------------------------------------------------------------
@@ -203,17 +217,26 @@ class Bridge:
                 self.layout = layout
                 self.by_cc = {(s.group, self.cc_base + s.encoder): s for s in layout.slots}
                 self.by_addr = {s.param.address: s for s in layout.slots}
+                self.by_raw = {s.param.raw_address: s for s in layout.slots}
                 self.values = {s.param.key: s.param.normalized for s in layout.slots}
+                self.raw = {s.param.key: s.param.value for s in layout.slots}
                 self.msb.clear()
             else:
-                # catch value changes the OSC listener might have missed
+                # catch value changes the OSC listener might have missed. Only trust a polled
+                # value once it's the same in two polls in a row: a snapshot taken while a knob
+                # is moving can be older than what the EC4 already shows.
                 now = time.monotonic()
                 for s in layout.slots:
                     k = s.param.key
+                    prev, self._polled[k] = self._polled.get(k), s.param.normalized
+                    if s.param.value is not None and now - self.touched.get(k, 0) >= 1.0:
+                        self.raw[k] = s.param.value
                     old = self.values.get(k)
                     if old is None or abs(old - s.param.normalized) < 1e-6:
                         continue
-                    if now - self.touched.get(k, 0) < max(self.holdoff, 1.0):
+                    if prev is None or abs(prev - s.param.normalized) > 1e-6:
+                        continue  # still changing (or first look): wait for the next poll
+                    if now - self.touched.get(k, 0) < max(self.holdoff, 1.0) + float(self.cfg["poll_interval"]):
                         continue
                     self.values[k] = s.param.normalized
                     self._feedback(self.by_addr[s.param.address], s.param.normalized)
@@ -341,20 +364,31 @@ class Bridge:
             lines.append(f"page {pages.index(g) + 1} of {len(pages)}")
         return lines
 
-    def notify(self, lines: list[str], seconds: float | None = None):
-        """Show a short message on the EC4's 4x20 overlay."""
+    def notify(self, lines: list[str], seconds: float | None = None, owner=None):
+        """Show a short message on the EC4's 4x20 overlay.
+
+        owner identifies what's on the overlay (e.g. the value pop-up of one parameter), so a
+        follow-up update can rewrite only the lines that changed.
+        """
         if not self.on_my_setup() or self.midi is None:
             return
         self._send_sysex(ec4_remote.overlay_text(lines))
         self._send_sysex(ec4_remote.overlay_show(True))
+        self._overlay_visible = True
+        self._overlay_owner = owner
+        self._overlay_lines = [((l or "") + " " * 20)[:20] for l in (list(lines) + [""] * 4)[:4]]
+        self._arm_overlay_timer(float(self.cfg["notify_seconds"] if seconds is None else seconds))
+
+    def _arm_overlay_timer(self, secs: float):
         if self._overlay_timer:
             self._overlay_timer.cancel()
-        secs = float(self.cfg["notify_seconds"] if seconds is None else seconds)
         self._overlay_timer = threading.Timer(secs, self._overlay_timeout)
         self._overlay_timer.daemon = True
         self._overlay_timer.start()
 
     def _overlay_timeout(self):
+        self._overlay_visible = False
+        self._overlay_owner = None
         self._list_page = None
         self._list_held = False
         if self._rotate_timer:
@@ -365,6 +399,79 @@ class Bridge:
         if self._overlay_timer:
             self._overlay_timer.cancel()
         self._overlay_timeout()
+
+    # ---- value pop-up while turning an encoder ---------------------------------
+    @staticmethod
+    def format_value(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        av = abs(v)
+        if v.is_integer() and av < 1e6:
+            return str(int(v))
+        if av >= 1000:
+            return f"{v:.0f}"
+        if av >= 100:
+            return f"{v:.1f}"
+        if av >= 10:
+            return f"{v:.2f}"
+        return f"{v:.3f}"
+
+    def value_popup_lines(self, slot: Slot, raw) -> list[str]:
+        from layout import strip_prefixes
+        p = slot.param
+        norm = min(1.0, max(0.0, self.values.get(p.key, p.normalized)))
+        if raw is None:
+            raw = self.raw.get(p.key)
+        units = self.cfg.get("units") or {}
+        unit = units.get(p.key, units.get(p.pid, p.unit)) if not isinstance(raw, str) else ""
+        value = self.format_value(raw)
+        if value and unit:
+            value = f"{value} {unit}"
+        filled = round(norm * 15)
+        bar = "#" * filled + "." * (15 - filled) + f"{round(norm * 100):>4}%"
+        device = strip_prefixes(p.inst_name, self.cfg.get("strip_prefixes") or [])
+        return [p.label[:20], value[:20], bar, device[:20]]
+
+    def value_popup(self, slot: Slot, raw):
+        """Full parameter name, value, bar and device on the overlay (throttled to ~12/s)."""
+        if not self.cfg.get("value_popup", True) or self._list_held:
+            return
+        if not self.on_my_setup() or self.paused() or self.midi is None:
+            return
+        self._popup_pending = (slot, raw)
+        wait = 0.08 - (time.monotonic() - self._popup_last)
+        if wait <= 0:
+            self._flush_popup()
+        elif not (self._popup_timer and self._popup_timer.is_alive()):
+            self._popup_timer = threading.Timer(wait, self._flush_popup)
+            self._popup_timer.daemon = True
+            self._popup_timer.start()
+
+    def _flush_popup(self):
+        pending, self._popup_pending = self._popup_pending, None
+        if pending is None or self._list_held:
+            return
+        self._popup_last = time.monotonic()
+        slot, raw = pending
+        lines = self.value_popup_lines(slot, raw)
+        secs = float(self.cfg["value_popup_seconds"])
+        owner = ("value", slot.param.key)
+        if self._overlay_visible and self._overlay_owner == owner and self.on_my_setup():
+            # same knob still turning: rewrite only the value and bar lines (rows 2-3)
+            rows = [((l or "") + " " * 20)[:20] for l in lines]
+            if rows[1:3] != self._overlay_lines[1:3]:
+                self._send_sysex(ec4_remote.write_text(ec4_remote.DISPLAY_OVERLAY, 20, rows[1] + rows[2]))
+                self._send_sysex(ec4_remote.overlay_show(True))
+                self._overlay_lines[1:3] = rows[1:3]
+            self._arm_overlay_timer(secs)
+        else:
+            self.notify(lines, seconds=secs, owner=owner)
 
     # ---- device list (SHIFT + push encoder 16 by default) ----------------------
     def _is_list_key(self, rep: dict) -> bool:
@@ -459,7 +566,10 @@ class Bridge:
     # ---- EC4 -> runner -----------------------------------------------------
     def on_cc(self, channel: int, cc: int, value: int):
         if not self.on_my_setup() or self.paused():
-            return  # the EC4 is on one of your other setups
+            return
+        sent = self._sent_cc.get((channel, cc))
+        if sent and sent[0] == value and time.monotonic() - sent[1] < 0.3:
+            return  # the EC4 echoing a value we just sent it, not a knob turn  # the EC4 is on one of your other setups
         if self.hi_res:
             if self.cc_base <= cc < self.cc_base + 16:
                 self.msb[(channel, cc)] = value
@@ -473,6 +583,12 @@ class Bridge:
             return
         if self.cc_base <= cc < self.cc_base + 16:
             self._set_from_ec4(channel, cc, value / 127.0)
+        elif self.cc_base + 32 <= cc < self.cc_base + 48 and not getattr(self, "_warned_14bit", False):
+            # the EC4 sends 14-bit pairs (CC n + CC n+32) but we're set to 7-bit: only the coarse
+            # half is read, so knobs lag and then jump
+            self._warned_14bit = True
+            log.warning("The EC4 is sending 14-bit values but resolution is '7bit'. Run 'send-layout' "
+                        "to reprogram the EC4 for 7-bit, or set \"resolution\": \"14bit\".")
 
     def _set_from_ec4(self, channel: int, cc: int, norm: float):
         with self.lock:
@@ -485,10 +601,22 @@ class Bridge:
             addr = slot.param.address
         if self.osc_send:
             self.osc_send(addr, float(norm))
+        # show the name and value right away (a linear estimate); the runner's exact value
+        # replaces it as soon as it comes back over OSC
+        self.value_popup(slot, slot.param.approx_value(norm))
 
     # ---- runner -> EC4 -----------------------------------------------------
     def on_osc(self, address: str, *args):
-        if not args or not address.endswith("/normalized"):
+        if not args:
+            return
+        raw_slot = self.by_raw.get(address)
+        if raw_slot is not None:
+            k = raw_slot.param.key
+            self.raw[k] = args[0]
+            if time.monotonic() - self.touched.get(k, 0) < self.cfg["value_popup_seconds"]:
+                self.value_popup(raw_slot, args[0])  # exact value for the encoder being turned
+            return
+        if not address.endswith("/normalized"):
             return
         try:
             v = float(args[0])
@@ -518,7 +646,11 @@ class Bridge:
     def _feedback(self, slot: Slot, v: float):
         if self.midi is None or not self.on_my_setup() or self.paused():
             return
-        self.midi.send_ccs(self._cc_messages(slot, v), pause=0)
+        msgs = self._cc_messages(slot, v)
+        now = time.monotonic()
+        for ch, cc, val in msgs:
+            self._sent_cc[(ch, cc)] = (val, now)
+        self.midi.send_ccs(msgs, pause=0)
 
     def resync(self):
         """Send every current value to the EC4."""
@@ -594,6 +726,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
 
     runner_ok = False
     last_refresh = time.monotonic()
+    slow_logged = 0.0
     log.info("bridge started; runner %s, EC4 match '%s', setup %s, %s",
              cfg["runner_host"], cfg["midi_port"], cfg["ec4_setup"], cfg["resolution"])
     while not stop.is_set():
@@ -606,7 +739,13 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         except Exception as exc:
             log.warning("MIDI port scan failed: %s", exc)
         try:
+            t_poll = time.monotonic()
             params = fetch_params(cfg)
+            took = time.monotonic() - t_poll
+            if took > 0.25 and time.monotonic() - slow_logged > 60:
+                slow_logged = time.monotonic()
+                log.info("reading the graph from the runner took %d ms (%d parameters); a larger "
+                         "poll_interval makes this happen less often", took * 1000, len(params))
             if not runner_ok:
                 log.info("runner reachable; registering OSC listener %s", listener)
                 client.send_message("/rnbo/listeners/add", listener)
@@ -817,6 +956,58 @@ def _send_layout(cfg: dict, args, data: bytes) -> int:
     return 0
 
 
+def cmd_monitor(cfg: dict, args) -> int:
+    """Print what the EC4 sends, with timing, to see whether values arrive late or skip."""
+    cc_base = int(cfg["cc_base"])
+    last: dict[tuple[int, int], tuple[float, int]] = {}
+    t0 = time.monotonic()
+
+    def on_cc(ch, cc, val):
+        now = time.monotonic()
+        prev = last.get((ch, cc))
+        last[(ch, cc)] = (now, val)
+        enc = cc - cc_base + 1 if cc_base <= cc < cc_base + 16 else None
+        fine = cc - cc_base - 31 if cc_base + 32 <= cc < cc_base + 48 else None
+        if enc:
+            where = f"group {ch + 1:>2} enc {enc:>2}       "
+        elif fine:
+            where = f"group {ch + 1:>2} enc {fine:>2} (fine)"
+            if not getattr(on_cc, "warned", False):
+                on_cc.warned = True
+                print("   (the EC4 sends 14-bit pairs: coarse value + fine value. If config.json says"
+                      " \"resolution\": \"7bit\", run send-layout to reprogram the EC4.)", flush=True)
+        else:
+            where = f"ch {ch + 1:>2} cc {cc:>3}            "
+        if prev:
+            dt = (now - prev[0]) * 1000
+            step = val - prev[1]
+            flag = "  <-- skipped" if abs(step) > 1 and dt < 300 else ""
+            print(f"{now - t0:8.3f}s  {where}  value {val:>3}  step {step:+3d}  {dt:6.1f} ms{flag}", flush=True)
+        else:
+            print(f"{now - t0:8.3f}s  {where}  value {val:>3}", flush=True)
+
+    def on_sysex(msg):
+        rep = ec4_remote.parse_report(msg)
+        what = ", ".join(f"{k}={v}" for k, v in rep.items()) if rep else f"{len(msg)} bytes"
+        print(f"{time.monotonic() - t0:8.3f}s  SysEx from EC4: {what}", flush=True)
+
+    midi = open_midi(cfg, on_cc=on_cc, on_sysex=on_sysex)
+    try:
+        midi.ensure_connected()
+        if not midi.connected:
+            print(f"No MIDI port matching '{cfg['midi_port']}' found.")
+            return 1
+        print("Turn encoders slowly, then quickly. Ctrl-C to stop.")
+        print("'step' is the change since the previous message; 'ms' the time since it.")
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        midi.close()
+    return 0
+
+
 def cmd_test_display(cfg: dict, args) -> int:
     """Check that the EC4 answers state requests and shows live display text."""
     q: queue.Queue[dict] = queue.Queue()
@@ -901,6 +1092,7 @@ def main(argv=None) -> int:
     p.add_argument("--fresh-backup", action="store_true", help="capture a new backup first")
     p.add_argument("--timeout", type=float, default=120)
     sub.add_parser("test-display", help="check live display text on the EC4")
+    sub.add_parser("monitor", help="show what the EC4 sends, with timing")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -908,7 +1100,7 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
     return {
         "run": cmd_run, "list": cmd_list, "capture-backup": cmd_capture_backup,
-        "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display,
+        "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display, "monitor": cmd_monitor,
     }[args.cmd](cfg, args)
 
 

@@ -16,7 +16,7 @@
   "cc_base": 16,
 
   "poll_interval": 2.0,
-  "feedback_holdoff_ms": 250,
+  "feedback_holdoff_ms": 1000,
 
   "new_group_per_instance": true,
   "include": [],
@@ -39,6 +39,9 @@
   "device_list_page_seconds": 2,
   "live_names_refresh": 0,
   "zero_unused": true,
+  "value_popup": true,
+  "value_popup_seconds": 1.5,
+  "units": { "0/cutoff": "Hz" },
 
   "backup_syx": "ec4-backup.syx",
   "layout_syx": "ec4-layout.syx",

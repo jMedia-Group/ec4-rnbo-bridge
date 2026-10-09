@@ -206,7 +206,7 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(lay.group_names[0], "revr")
         self.assertEqual([s.short for s in lay.slots], ["size", "decy"])
         lay = build_layout(parse_params(tree), cfg())
-        self.assertEqual(lay.group_names[0], "jre")  # without the option
+        self.assertEqual(lay.group_names[0], "jRev")  # without the option
 
     def test_group_title_style(self):
         lay = build_layout(self.params, cfg(group_title_style="number", group_names={"0": "Syn"}))
@@ -261,7 +261,26 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(abbreviate("LFO"), "LFO")
         self.assertEqual(abbreviate("mix"), "mix")
         self.assertEqual(abbreviate("Filter Env Amount"), "FiEA")
-        self.assertEqual(abbreviate("filter env amount"), "fiea")
+        self.assertEqual(abbreviate("filter env amount"), "fiEA")
+        # names with spaces: first word's letters + capital initial of the next word(s)
+        self.assertEqual(abbreviate("foo bar"), "fooB")
+        self.assertEqual(abbreviate("delay time"), "delT")
+        self.assertEqual(abbreviate("Delay Time"), "DelT")
+        self.assertEqual(abbreviate("osc 2 level"), "os2L")
+        self.assertEqual(abbreviate("a b c d e"), "aBCD")
+        self.assertEqual(abbreviate("  mix   level "), "mixL")
+        self.assertEqual(abbreviate("foo bar", case="upper"), "FOOB")
+        self.assertEqual(abbreviate("foo bar", case="title"), "FooB")
+        # camelCase / under_scores follow the same rule
+        self.assertEqual(abbreviate("fooBar"), "fooB")
+        self.assertEqual(abbreviate("filterEnv"), "filE")
+        self.assertEqual(abbreviate("filterEnvAmount"), "fiEA")
+        self.assertEqual(abbreviate("lfo_rate"), "lfoR")
+        self.assertEqual(abbreviate("LFORate"), "LFOR")
+        self.assertEqual(abbreviate("j.reverb"), "jRev")
+        self.assertEqual(abbreviate("j.reverb", 3), "jRe")
+        self.assertEqual(abbreviate("x y"), "xY")
+        self.assertEqual(abbreviate("filterEnv amount"), "filA")  # spaces win; camel word kept whole
         # other styles
         self.assertEqual(abbreviate("cutoff", case="title"), "Cutf")
         self.assertEqual(abbreviate("osc2Level", case="title"), "Os2L")
@@ -321,6 +340,36 @@ class BridgeTests(unittest.TestCase):
         b.on_cc(0, 1, 64)  # other CC -> ignored
         self.assertEqual(len(self.osc), 1)
 
+    def test_late_report_does_not_snap_knob_back(self):
+        b = self.make()  # default hold-off: 1 s
+        self.midi.sent.clear()
+        b.on_cc(2, 18, 100)  # turn 'mix' up
+        time.sleep(0.4)  # a slow runner reports an older value 400 ms later
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 20 / 127)
+        self.assertEqual(self.midi.sent, [])  # the knob is not pulled back
+
+    def test_poll_never_pulls_back_a_turned_knob(self):
+        b = self.make(poll_interval=0.0)
+        tree = default_tree()
+        node = tree["CONTENTS"]["1"]["CONTENTS"]["params"]["CONTENTS"]["mix"]["CONTENTS"]["normalized"]
+        node["VALUE"] = [0.3]
+        b.update_from_params(parse_params(tree))
+        b.on_cc(2, 18, 120)  # user turns mix up; snapshots still say 0.3 for a while
+        self.midi.sent.clear()
+        b.update_from_params(parse_params(tree))
+        b.update_from_params(parse_params(tree))
+        self.assertEqual(self.midi.sent, [])
+
+    def test_echo_of_feedback_is_not_a_turn(self):
+        b = self.make()
+        time.sleep(0.01)
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.5)  # changed in the web UI
+        self.assertEqual(self.midi.sent[-1], (2, 18, 64))
+        b.on_cc(2, 18, 64)  # EC4 echoes it straight back (MIDI thru/merge)
+        self.assertEqual(self.osc, [])  # not sent to RNBO as a turn
+        b.on_cc(2, 18, 65)  # a real turn
+        self.assertEqual(self.osc, [("/rnbo/inst/1/params/mix/normalized", 65 / 127)])
+
     def test_feedback_and_holdoff(self):
         b = self.make()
         self.midi.sent.clear()
@@ -333,8 +382,16 @@ class BridgeTests(unittest.TestCase):
         b.on_osc("/rnbo/inst/1/params/mix", 0.5)  # raw value address is ignored
         self.assertEqual(self.midi.sent, [])
 
+    def test_warns_when_ec4_sends_14bit_but_config_is_7bit(self):
+        b = self.make()
+        with self.assertLogs("ec4bridge", level="WARNING") as logs:
+            b.on_cc(0, 48, 33)  # fine half of a 14-bit pair
+            b.on_cc(0, 48, 34)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("14-bit", logs.output[0])
+
     def test_14bit(self):
-        b = self.make(resolution="14bit")
+        b = self.make(resolution="14bit", feedback_holdoff_ms=250)
         self.midi.sent.clear()
         b.on_cc(0, 16, 64)  # MSB alone does nothing
         self.assertEqual(self.osc, [])
@@ -352,6 +409,8 @@ class BridgeTests(unittest.TestCase):
         tree["CONTENTS"]["1"]["CONTENTS"]["params"]["CONTENTS"]["mix"]["CONTENTS"]["normalized"]["VALUE"] = [1.0]
         changed = b.update_from_params(parse_params(tree))
         self.assertFalse(changed)
+        self.assertEqual(self.midi.sent, [])  # seen once: could be a snapshot mid-change
+        b.update_from_params(parse_params(tree))  # same value in the next poll -> trust it
         self.assertEqual(self.midi.sent, [(2, 18, 127)])
 
     def test_osc_over_udp(self):
@@ -454,6 +513,10 @@ class RunLoopTest(unittest.TestCase):
                 stop.set()
                 t.join(timeout=5)
                 ec4bridge.open_midi = orig
+                for _ in range(50):  # the last UDP message may still be in flight
+                    if any(a == "/rnbo/listeners/del" for a, _ in got):
+                        break
+                    time.sleep(0.02)
                 osc_in.shutdown()
                 osc_in.server_close()
                 runner.close()
@@ -630,7 +693,20 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertFalse(b.paused())
 
     def overlays(self):
-        return [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+        """Overlay screen contents after each write (writes may start mid-screen)."""
+        screen = [" "] * 80
+        out = []
+        for m in self.midi.sysex:
+            if m[7:10] != bytes([0x4E, 0x22, 0x13]):
+                continue
+            off = (m[11] - 0x20) * 16 + (m[12] - 0x10)
+            for i, ch in enumerate(self.text(m)):
+                screen[off + i] = ch
+            out.append("".join(screen))
+        return out
+
+    def overlay_writes(self):
+        return [m for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
 
     def test_device_list_popup(self):
         b = self.make(notify_group_change=True, device_list_mode="toggle")
@@ -726,6 +802,85 @@ class LiveDisplayTests(unittest.TestCase):
         time.sleep(0.12)
         self.assertEqual(len(self.overlays()), n)  # stopped flipping after release
 
+    def test_value_popup_on_turn(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_cc(0, 17, 127)  # group 1 encoder 2 = cutoff, turned to max
+        ov = self.overlays()
+        self.assertEqual(len(ov), 1)
+        rows = [ov[0][i:i + 20].rstrip() for i in range(0, 80, 20)]
+        self.assertEqual(rows, ["Cutoff", "20000", "############### 100%", "polysynth"])
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        # the runner reports the exact value back -> pop-up shows it
+        time.sleep(0.1)
+        b.on_osc("/rnbo/inst/0/params/cutoff", 1234.4)
+        rows = [self.overlays()[-1][i:i + 20].rstrip() for i in range(0, 80, 20)]
+        self.assertEqual(rows, ["Cutoff", "1234", "############### 100%", "polysynth"])
+        # the follow-up only rewrote rows 2-3 (40 characters starting at position 20)
+        last = self.overlay_writes()[-1]
+        self.assertEqual(last[10:13], bytes([0x4A, 0x21, 0x14]))
+        self.assertEqual(len(last), 13 + 40 * 3 + 1)
+
+    def test_value_popup_enum_and_throttle(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_cc(0, 21, 127)  # wave (enum) -> "square"
+        b.on_cc(0, 21, 0)    # immediately again: throttled, shown a moment later
+        self.assertEqual(len(self.overlays()), 1)
+        self.assertEqual(self.overlays()[0][20:40].rstrip(), "square")
+        time.sleep(0.15)
+        self.assertEqual(len(self.overlays()), 2)
+        self.assertEqual(self.overlays()[1][20:40].rstrip(), "sine")
+        self.assertEqual(self.overlays()[1][:20].rstrip(), "wave")  # name still on screen
+
+    def test_value_popup_not_for_runner_changes_or_when_off(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_osc("/rnbo/inst/0/params/cutoff", 500.0)  # value changed elsewhere, nobody turning
+        self.assertEqual(self.overlays(), [])
+        self.assertEqual(b.raw["0/cutoff"], 500.0)
+        b2 = self.make(value_popup=False)
+        self.midi.sysex.clear()
+        b2.on_cc(0, 17, 64)
+        self.assertEqual(self.overlays(), [])
+
+    def test_value_popup_waits_for_device_list(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        b.on_sysex(key_press(shift_key=15))  # holding the device list
+        self.midi.sysex.clear()
+        b.on_cc(0, 17, 64)
+        self.assertEqual(self.overlays(), [])
+        b._hide_overlay()
+
+    def test_value_popup_units(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {"0": make_instance(0, "synth", [
+            ("cutoff", 0, 1000.0, 20.0, 20000.0, "Cutoff", None, 0, None, "Hz"),
+            ("attack", 1, 10.0, 0.0, 1000.0, "", None, 0, None, None, '{"unit": "ms"}'),
+            ("drive", 2, 0.5),
+            ("wave", 3, 1, 0, 1, "", None, 3, ["sine", "saw", "square"], "Hz"),
+        ])}}
+        params = parse_params(tree)
+        self.assertEqual([p.unit for p in params], ["Hz", "ms", "", "Hz"])
+        self.midi = FakeMidi()
+        b = Bridge(cfg(layout_txt=os.path.join(self.tmp.name, "l.txt"), backup_syx="none",
+                       units={"drive": "dB"}), midi=self.midi)
+        b.update_from_params(params)
+        lines = lambda i: b.value_popup_lines(b.layout.slots[i], None)
+        self.assertEqual(lines(0)[1], "1000 Hz")
+        self.assertEqual(lines(1)[1], "10 ms")
+        self.assertEqual(lines(2)[1], "0.500 dB")  # from config
+        self.assertEqual(lines(3)[1], "saw")  # enums never get a unit
+
+    def test_format_value(self):
+        f = Bridge.format_value
+        self.assertEqual([f(3.0), f(0.5), f(12.345), f(123.45), f(4321.6), f("saw"), f(None)],
+                         ["3", "0.500", "12.35", "123.5", "4322", "saw", ""])
+
     def test_live_names_off(self):
         self.make(live_names=False, notify_graph_change=False)
         self.assertEqual(self.midi.sysex, [])
@@ -789,6 +944,41 @@ class TestDisplayCommandTests(unittest.TestCase):
 def argparse_ns(**kw):
     import argparse
     return argparse.Namespace(**kw)
+
+
+class OutQueueTests(unittest.TestCase):
+    def test_coalesce(self):
+        from outqueue import coalesce
+        t1 = ("sysex", rm.overlay_text(["a"]))
+        t2 = ("sysex", rm.overlay_text(["b"]))
+        part = ("sysex", rm.write_text(rm.DISPLAY_OVERLAY, 20, "x" * 40))
+        show, hide = ("sysex", rm.overlay_show(True)), ("sysex", rm.overlay_show(False))
+        names = ("sysex", rm.names_page(["n"]))
+        req = ("sysex", rm.REQUEST_INFO)
+        items = [("cc", 0, 16, 1), t1, show, ("cc", 0, 16, 5), ("cc", 1, 16, 9), req, t2, part,
+                 hide, show, names, req]
+        out = coalesce(items)
+        self.assertEqual(out, [("cc", 0, 16, 5), ("cc", 1, 16, 9), req, t2, part, show, names, req])
+
+    def test_queue_writes_in_background(self):
+        from outqueue import OutQueue
+        written = []
+        gate = threading.Event()
+
+        def slow_cc(ch, cc, v):
+            gate.wait(1)  # the EC4 is slow to take data
+            written.append((ch, cc, v))
+
+        q = OutQueue(slow_cc, lambda d: written.append(d))
+        t0 = time.monotonic()
+        for v in range(50):
+            q.cc(0, 16, v)  # never blocks the caller
+        self.assertLess(time.monotonic() - t0, 0.1)
+        gate.set()
+        self.assertTrue(q.flush(2))
+        self.assertEqual(written[-1], (0, 16, 49))  # newest value always arrives
+        self.assertLess(len(written), 50)  # stale ones were dropped
+        q.close()
 
 
 class CliTests(unittest.TestCase):
