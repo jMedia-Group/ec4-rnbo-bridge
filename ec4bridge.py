@@ -67,6 +67,7 @@ DEFAULTS = {
     "live_names_refresh": 0,
     "notify_graph_change": True,
     "notify_seconds": 2.5,
+    "notify_group_change": True,
 }
 
 
@@ -223,6 +224,8 @@ class Bridge:
             self.write_names()
         elif mine and self.cur_group != old_group:
             self.write_names()
+            if old_group is not None and self.cfg["notify_group_change"] and self.cur_group is not None:
+                self.notify(self._group_summary(self.cur_group))
         elif was_mine and not mine:
             log.info("EC4 switched to setup %d; pausing until it's back on setup %d",
                      self.cur_setup + 1, self.my_setup + 1)
@@ -257,6 +260,22 @@ class Bridge:
         if len(lines) > 3:
             lines = lines[:2] + [f"   +{len(lines) - 2} more"]
         return ["RNBO graph loaded"] + lines
+
+    def _group_summary(self, g: int) -> list[str]:
+        """Overlay text for a group: its instance's full name (group names can't be written live)."""
+        from layout import strip_prefixes
+        prefixes = self.cfg.get("strip_prefixes") or []
+        with self.lock:
+            in_group = [s for s in self.layout.slots if s.group == g]
+            if not in_group:
+                return [f"Group {g + 1}", "(no parameters)"]
+            inst = in_group[0].param.inst
+            name = strip_prefixes(in_group[0].param.inst_name, prefixes)
+            pages = sorted({s.group for s in self.layout.slots if s.param.inst == inst})
+        lines = [f"Group {g + 1}", name[:20]]
+        if len(pages) > 1:
+            lines.append(f"page {pages.index(g) + 1} of {len(pages)}")
+        return lines
 
     def notify(self, lines: list[str]):
         """Show a short message on the EC4's 4x20 overlay."""
@@ -351,7 +370,7 @@ def write_layout_syx(cfg: dict, layout: Layout) -> bytes:
     ec4_sysex.apply_layout(
         dump, int(cfg["ec4_setup"]) - 1, cfg["setup_name"], layout.group_names, layout.encoder_names(),
         cc_base=int(cfg["cc_base"]), resolution=cfg["resolution"], mode=cfg["encoder_mode"],
-        display=cfg["display"] or None,
+        display=cfg["display"] or None, live_names=bool(cfg["live_names"]),
     )
     data = ec4_sysex.build_dump(dump)
     tmp = cfg["layout_syx"] + ".tmp"
@@ -545,7 +564,9 @@ def cmd_send_layout(cfg: dict, args) -> int:
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             return 1
-    midi = open_midi(cfg)
+    bridge = Bridge(cfg)
+    midi = open_midi(cfg, on_sysex=bridge.on_sysex)
+    bridge.midi = midi
     try:
         midi.ensure_connected()
         if not midi.connected:
@@ -560,9 +581,14 @@ def cmd_send_layout(cfg: dict, args) -> int:
         midi.send_sysex_chunks(chunks, pause, progress)
         print("\nDone. The EC4 shows the progress and returns to normal when finished.")
         time.sleep(3)
-        bridge = Bridge(dict(cfg, live_names=False), midi=midi)
-        bridge.update_from_params(fetch_params(cfg))  # also sends all current values
-        print("Sent current parameter values to the EC4.")
+        bridge.request_ec4_state()  # so names only go to the screen if the RNBO setup is showing
+        time.sleep(1)
+        bridge.update_from_params(fetch_params(cfg))  # sends all current values and live names
+        if cfg["live_names"]:
+            print("Sent current values and names to the EC4. Encoder names are stored as '----'")
+            print("so the bridge can write them live; select the RNBO setup to see them.")
+        else:
+            print("Sent current parameter values to the EC4.")
     finally:
         midi.close()
     return 0
@@ -613,9 +639,24 @@ def cmd_test_display(cfg: dict, args) -> int:
         midi.send_sysex(ec4_remote.overlay_show(True))
         time.sleep(4)
         midi.send_sysex(ec4_remote.overlay_show(False))
-        print("   If you saw the text, live names will work.")
+        print("   If you saw the text, live display text works.")
+
+        print("3) Writing test names (T01 ... T16) on the encoder names for 4 seconds ...")
+        midi.send_sysex(ec4_remote.names_page([f"T{e + 1:02d}" for e in range(16)]))
+        time.sleep(4)
+        names: list = [None] * 16
+        try:  # put the real names back for the group that's showing
+            lay = build_layout(fetch_params(cfg), cfg)
+            names = lay.encoder_names()[before.get("group", 0)]
+        except Exception:
+            pass
+        midi.send_sysex(ec4_remote.names_page(names))
+        print("   T01..T16 appeared  -> live names work.")
+        print("   Old names stayed   -> the encoder names stored in this setup aren't '----'.")
+        print("                         Run 'send-layout' once (with live_names on) to fix that.")
         if before.get("setup") != int(cfg["ec4_setup"]) - 1:
-            print(f"   Note: names only appear while the EC4 is on setup {cfg['ec4_setup']} (the RNBO setup).")
+            print(f"   Note: the EC4 is on setup {before.get('setup', -1) + 1}; the bridge writes names only"
+                  f" while it's on setup {cfg['ec4_setup']} (the RNBO setup).")
     finally:
         midi.close()
     return 0

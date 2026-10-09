@@ -108,6 +108,21 @@ class SysexTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sx.apply_layout(d, 0, "R", [], names, cc_base=16, resolution="14bit", mode="Acc1", display="127")
 
+    def test_live_names_placeholders(self):
+        d = synthetic_dump()
+        names = [[None] * 16 for _ in range(16)]
+        names[0][0] = "cutf"
+        sx.apply_layout(d, 15, "RNBO", ["syn"], names, cc_base=16, resolution="7bit",
+                        mode="Acc1", live_names=True)
+        n = sx.read_names(d, 15)
+        self.assertEqual(set(sum(n["encoders"], [])), {"----"})  # every encoder writable live
+        self.assertEqual(n["groups"][0], "syn ")  # group names still stored
+        for g in (0, 7):
+            b = sx._group_base(15, g)
+            self.assertEqual({d.memory[b + 80 + e] & 0xF for e in range(16)}, {2})  # display on everywhere
+        sx.apply_layout(d, 15, "RNBO", ["syn"], names, cc_base=16, resolution="7bit", mode="Acc1")
+        self.assertEqual(sx.read_names(d, 15)["encoders"][0][:2], ["cutf", "    "])
+
     def test_14bit_limits(self):
         d = synthetic_dump()
         names = [["Abcd"] * 16 for _ in range(16)]
@@ -459,6 +474,28 @@ class LiveDisplayTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(self.midi.sysex[-1], rm.overlay_show(False))  # overlay hidden again
 
+    def test_group_change_popup(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 1))  # switch to group 2 = second page of the synth
+        overlay = [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+        self.assertEqual(len(overlay), 1)
+        self.assertTrue(overlay[0].startswith("Group 2"))
+        self.assertIn("polysynth", overlay[0])
+        self.assertIn("page 2 of 2", overlay[0])
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 2))
+        self.assertIn("Delay", [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])][0])
+
+    def test_group_popup_off(self):
+        b = self.make(notify_group_change=False)
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        b.on_sysex(report(15, 2))
+        self.assertFalse(any(m[7:10] == bytes([0x4E, 0x22, 0x13]) for m in self.midi.sysex))
+        self.assertTrue(self.names_written())
+
     def test_live_names_off(self):
         self.make(live_names=False, notify_graph_change=False)
         self.assertEqual(self.midi.sysex, [])
@@ -509,10 +546,13 @@ class TestDisplayCommandTests(unittest.TestCase):
         text = out.getvalue()
         self.assertEqual(rc, 0)
         self.assertIn("EC4 reports setup 3, group 1", text)
-        self.assertIn("names only appear while the EC4 is on setup 16", text)
+        self.assertIn("writes names only while it's on setup 16", text)
         sent = holder["ec4"].sysex
         self.assertIn(rm.overlay_show(True), sent)
-        self.assertEqual(sent[-1], rm.overlay_show(False))
+        self.assertIn(rm.overlay_show(False), sent)
+        pages = [m for m in sent if m[7:10] == bytes([0x4E, 0x22, 0x10])]
+        self.assertEqual(len(pages), 2)  # test names, then the real ones back
+        self.assertTrue(LiveDisplayTests.text(pages[0]).startswith("T01 T02 T03 T04 "))
         self.assertFalse(any(m[7:9] == bytes([0x4E, 0x28]) for m in sent))  # never asks to switch setup
 
 
@@ -544,7 +584,8 @@ class CliTests(unittest.TestCase):
                     out = sx.parse_dump(f.read())
                 names = sx.read_names(out, 15)
                 self.assertEqual(names["groups"][:3], ["pol1", "pol2", "Dely"])
-                self.assertEqual(names["encoders"][2][:3], ["time", "fedb", "mix "])
+                self.assertEqual(names["encoders"][2][:3], ["----", "----", "----"])  # live names
+                self.assertEqual(set(sum(names["encoders"], [])), {"----"})
         finally:
             runner.close()
 

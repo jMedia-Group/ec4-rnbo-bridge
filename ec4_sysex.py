@@ -64,6 +64,7 @@ ENCODER_MODES = {
     "LSp2": 7, "LSp4": 8, "LSp6": 9,
 }
 
+LIVE_NAME_PLACEHOLDER = "----"  # encoder name the EC4 lets a host overwrite live
 NAME_CHARS = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ./-")
 
 
@@ -197,13 +198,16 @@ def read_names(dump: Dump, setup: int) -> dict:
 
 def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str],
                  encoder_names: list[list[str | None]], *, cc_base: int, resolution: str,
-                 mode: str, display: str | None = None) -> None:
+                 mode: str, display: str | None = None, live_names: bool = False) -> None:
     """Program one setup (0-based) with the bridge's fixed MIDI scheme.
 
     Encoder e in group g sends CC (cc_base + e) on MIDI channel g+1, absolute mode.
     encoder_names[g][e] is a 4-char name, or None for an unused encoder (display off).
     Push buttons are switched off. Other setups are left untouched.
     display is the EC4 value display (see DISPLAY_SCALES); None = default for the resolution.
+    live_names=True stores '----' as every encoder name and turns the value display on for every
+    encoder: the EC4 only accepts names written live over SysEx on encoders named '----'
+    (EC4 manual V03), and which encoders are in use changes with every graph.
     """
     if not 0 <= setup < 16:
         raise ValueError("setup must be 0..15")
@@ -237,7 +241,7 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
             else:
                 etype, scale = TYPE_CC_ABS, display_code
                 lower, upper, msbs = 0, 127, 0x00
-            if not used:
+            if not used and not live_names:
                 scale = SCALE_OFF
             m[base + F_TYPE_CHANNEL + e] = (etype << 4) | g
             m[base + F_NUMBER + e] = (cc_base + e) & 0x7F  # link bit cleared
@@ -248,7 +252,8 @@ def apply_layout(dump: Dump, setup: int, setup_name: str, group_names: list[str]
             m[base + F_LIMIT_MSB + e] = msbs
             m[base + F_PB_TYPE_CHANNEL + e] = (PB_TYPE_OFF << 4) | g
             a = base + F_NAMES + e * 4
-            m[a:a + 4] = clean_name(name or "").encode("latin-1")
+            stored = LIVE_NAME_PLACEHOLDER if live_names else (name or "")
+            m[a:a + 4] = clean_name(stored).encode("latin-1")
 
 
 def split_for_sending(data: bytes) -> list[bytes]:

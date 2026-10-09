@@ -59,9 +59,10 @@ made earlier. The bridge's own MIDI ports are hidden from JACK, so they never sh
 
 ## First-time EC4 setup
 
-`send-layout` programs the RNBO setup on the EC4 (MIDI channels, CCs, display style, and names
-as a fallback). You need it **once**, and again only if you change `ec4_setup`, `resolution`,
-`cc_base`, `encoder_mode` or `display`. Names after that are updated live (see below).
+`send-layout` programs the RNBO setup on the EC4 (MIDI channels, CCs, display style, group
+names). You need it **once**, and again only if you change `ec4_setup`, `resolution`, `cc_base`,
+`encoder_mode` or `display`, or want new **group** names stored. Encoder names after that are
+updated live (see below).
 
 The EC4 only accepts a dump of **all 16 setups** at once. So the bridge first saves your current
 setups, then sends them back unchanged except for the one it uses:
@@ -80,18 +81,27 @@ Faderfox web editor.
 
 ## Live names and graph changes (firmware 2.0+)
 
-The bridge writes parameter names straight onto the EC4's display, without the Receive menu:
+The bridge writes parameter names straight onto the EC4's display, without the Receive menu.
+This only works on encoders whose stored name is exactly `----` (EC4 manual: "Set encoder names
+to '----' else the script can't write the names"). With `live_names` on, `send-layout` stores
+`----` for every encoder of the RNBO setup, so **run `send-layout` once after turning live names
+on** (or after updating from a version without live names).
 
 - **When a new graph loads**, the names for the group you're on change within ~2 seconds, and a
   short message ("RNBO graph loaded" plus the instances and their group numbers) pops up.
-- **When you switch groups** on the EC4, it tells the bridge, which writes that group's names.
+- **When you switch groups** on the EC4, it tells the bridge, which writes that group's names
+  and pops up the instance's full name (and "page 2 of 3" if it spans several groups).
+- **Group names** (the 4×4 matrix shown while choosing a group) can't be written live; they come
+  from the last `send-layout`. The pop-up is there to make up for that.
 - **When you switch to one of your other setups**, the bridge pauses: those encoders don't
   touch RNBO and the bridge doesn't send them values. Coming back resends values and names.
 
 The names page shows names; if you've pressed BAR or NUM to show values, press NAME to go back.
 
-To check that your EC4 accepts live text, run `venv/bin/python ec4bridge.py test-display`: it
-asks the EC4 which setup it's on and shows a test message on its display for 4 seconds.
+To check, run `venv/bin/python ec4bridge.py test-display` with the EC4 on the RNBO setup. It asks
+the EC4 which setup it's on, shows a test message for 4 seconds, then writes `T01`…`T16` as encoder
+names for 4 seconds. If the test names don't appear, the stored names aren't `----` yet: run
+`send-layout`.
 
 ## Run it as a service
 
@@ -134,6 +144,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `live_names` | `true` | write names onto the EC4 display live (firmware 2.0+) |
 | `notify_graph_change` | `true` | pop up a short message on the EC4 when a new graph loads |
 | `notify_seconds` | 2.5 | how long that message stays |
+| `notify_group_change` | `true` | pop up the instance name when you switch groups |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |
 | `feedback_holdoff_ms` | 250 | don't echo a value back to an encoder you're turning |

@@ -29,6 +29,7 @@
   "live_names": true,
   "notify_graph_change": true,
   "notify_seconds": 2.5,
+  "notify_group_change": true,
   "live_names_refresh": 0,
 
   "backup_syx": "ec4-backup.syx",
