@@ -30,6 +30,7 @@ class Trace:
         self._lock = threading.Lock()
         self.until = 0.0
         self.t0 = 0.0
+        self.clock_offset = 0.0  # wall clock minus monotonic, to print times you can match to logs
         self.events: list[tuple] = []
 
     @property
@@ -39,6 +40,7 @@ class Trace:
     def start(self, seconds: float):
         with self._lock:
             self.t0 = time.monotonic()
+            self.clock_offset = time.time() - self.t0
             self.until = self.t0 + seconds
             self.events = []
 
@@ -59,13 +61,19 @@ def _ms(s: float) -> str:
     return f"{s * 1000:.0f} ms"
 
 
-def analyze(events: list[tuple], params: dict[str, tuple[str, int]] | None = None) -> list[str]:
-    """Summary lines. params: {osc address: (label, steps)}."""
+def analyze(events: list[tuple], params: dict[str, tuple[str, int]] | None = None,
+            clock_offset: float | None = None) -> list[str]:
+    """Summary lines. params: {osc address: (label, steps)}. clock_offset: wall clock minus
+    monotonic time; when given, times also show the time of day (to match the runner's log)."""
     params = params or {}
     if not events:
         return ["no events recorded (did you turn any knobs?)"]
     t0 = events[0][0]
-    rel = lambda t: f"{t - t0:6.2f}s"  # noqa: E731
+    def rel(t: float) -> str:
+        s = f"{t - t0:6.2f}s"
+        if clock_offset is not None:
+            s += time.strftime(" (%H:%M:%S)", time.localtime(t + clock_offset))
+        return s
     out: list[str] = []
 
     sets = [e for e in events if e[1] == "set"]           # (t, set, key, address, norm)

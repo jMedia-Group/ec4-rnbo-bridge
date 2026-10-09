@@ -813,11 +813,12 @@ def start_trace(bridge: Bridge, seconds: float):
 
 
 def finish_trace(bridge: Bridge) -> str | None:
+    offset = bridge.trace.clock_offset
     events = bridge.trace.take()
     with bridge.lock:
         params = {s.param.address: (f"{s.param.key} ({s.param.label})", s.param.steps)
                   for s in bridge.layout.slots}
-    summary = analyze(events, params)
+    summary = analyze(events, params, offset)
     path = os.path.join(TRACE_DIR, time.strftime("trace-%Y%m%d-%H%M%S.txt"))
     try:
         with open(path, "w") as f:
