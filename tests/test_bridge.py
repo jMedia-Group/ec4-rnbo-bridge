@@ -163,21 +163,6 @@ class SysexTests(unittest.TestCase):
 
 
 class GraphSignatureTests(unittest.TestCase):
-    def test_graph_read_in_pieces_matches_full_tree(self):
-        from rnbo import fetch_graph
-        runner = MockRunner()
-        try:
-            full = parse_params(runner.tree)
-            pieces = parse_params(fetch_graph("127.0.0.1", runner.port, pause=0))
-            self.assertEqual([(p.key, p.label, p.inst_name, p.address, p.normalized, p.enum_values)
-                              for p in pieces],
-                             [(p.key, p.label, p.inst_name, p.address, p.normalized, p.enum_values)
-                              for p in full])
-            self.assertNotIn("/rnbo/inst", runner.requests)
-            self.assertIn("/rnbo/inst/1/params", runner.requests)
-        finally:
-            runner.close()
-
     def test_signature_changes_only_with_the_graph(self):
         from rnbo import graph_signature, instance_names
         runner = MockRunner()
@@ -541,8 +526,7 @@ class RunLoopTest(unittest.TestCase):
                 self.assertEqual(fake.sent, [(2, 16, 0)])
                 # the whole graph was read once; after that only cheap checks
                 time.sleep(0.5)
-                self.assertNotIn("/rnbo/inst", runner.requests)  # never the whole tree at once
-                self.assertEqual(runner.requests.count("/rnbo/inst/0/params"), 1)
+                self.assertEqual(runner.requests.count("/rnbo/inst"), 1)
                 self.assertIn("/rnbo/inst/control/sets/current/name", runner.requests)
                 self.assertIn("/rnbo/inst/1/name", runner.requests)
                 # load a different patcher -> layout rebuilt and written
@@ -566,7 +550,7 @@ class RunLoopTest(unittest.TestCase):
                 osc_in.server_close()
                 runner.close()
         self.assertFalse(t.is_alive())
-        self.assertEqual(runner.requests.count("/rnbo/inst/0/params"), 2)  # start-up + after the change
+        self.assertEqual(runner.requests.count("/rnbo/inst"), 2)  # start-up + after the change
         self.assertIn(("/rnbo/listeners/del", (f"127.0.0.1:{listen_port}",)), got)
 
 
@@ -853,15 +837,12 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
         b.on_cc(0, 17, 127)  # group 1 encoder 2 = cutoff, turned to max
-        self.assertEqual(self.overlays(), [])  # nothing drawn while the knob is moving
-        time.sleep(0.2)  # knob rests
-        ov = self.overlays()
+        ov = self.overlays()  # drawn right away
         self.assertEqual(len(ov), 1)
         rows = [ov[0][i:i + 20].rstrip() for i in range(0, 80, 20)]
         self.assertEqual(rows, ["Cutoff", "20000", "############### 100%", "polysynth"])
         self.assertIn(rm.overlay_show(True), self.midi.sysex)
         # the runner reports the exact value back -> pop-up shows it
-        time.sleep(0.1)
         b.on_osc("/rnbo/inst/0/params/cutoff", 1234.4)
         rows = [self.overlays()[-1][i:i + 20].rstrip() for i in range(0, 80, 20)]
         self.assertEqual(rows, ["Cutoff", "1234", "############### 100%", "polysynth"])
@@ -870,32 +851,24 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertEqual(last[10:13], bytes([0x4A, 0x21, 0x14]))
         self.assertEqual(len(last), 13 + 40 * 3 + 1)
 
-    def test_value_popup_enum_and_throttle(self):
-        b = self.make(value_popup_mode="live", value_popup_interval_ms=80)
+    def test_value_popup_enum_updates_while_turning(self):
+        b = self.make()
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
         b.on_cc(0, 21, 127)  # wave (enum) -> "square"
-        b.on_cc(0, 21, 0)    # immediately again: throttled, shown a moment later
-        self.assertEqual(len(self.overlays()), 1)
-        self.assertEqual(self.overlays()[0][20:40].rstrip(), "square")
-        time.sleep(0.15)
-        self.assertEqual(len(self.overlays()), 2)
-        self.assertEqual(self.overlays()[1][20:40].rstrip(), "sine")
-        self.assertEqual(self.overlays()[1][:20].rstrip(), "wave")  # name still on screen
+        self.assertEqual(self.overlays()[-1][20:40].rstrip(), "square")
+        b.on_cc(0, 21, 0)
+        self.assertEqual(self.overlays()[-1][20:40].rstrip(), "sine")
+        self.assertEqual(self.overlays()[-1][:20].rstrip(), "wave")  # name still on screen
 
-    def test_value_popup_waits_until_knob_rests(self):
-        b = self.make()  # default mode: rest
+    def test_value_popup_follows_a_turn(self):
+        b = self.make()
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
-        for v in range(40, 80):  # a 0.4 s turn
+        for v in range(40, 80):
             b.on_cc(0, 17, v)
-            time.sleep(0.01)
-            self.assertEqual(self.overlays(), [])  # the EC4 is never asked to draw mid-turn
-        time.sleep(0.2)
-        ov = self.overlays()
-        self.assertEqual(len(ov), 1)  # one pop-up, with where the knob ended up
-        self.assertEqual(ov[0][40:60].rstrip(), "#" * round(79 / 127 * 15) + "." * (15 - round(79 / 127 * 15))
-                         + f"{round(79 / 127 * 100):>4}%")
+        bar = "#" * round(79 / 127 * 15) + "." * (15 - round(79 / 127 * 15)) + f"{round(79 / 127 * 100):>4}%"
+        self.assertEqual(self.overlays()[-1][40:60].rstrip(), bar)
 
     def test_value_popup_not_for_runner_changes_or_when_off(self):
         b = self.make()
@@ -1074,9 +1047,6 @@ class SlowEC4:
     def invalidate_display(self, d=None, visibility=False):
         self.q.invalidate(d, visibility)
 
-    def hold_display(self, seconds):
-        self.q.hold_display(seconds)
-
 
 class DisplayPacingTests(unittest.TestCase):
     def test_one_message_in_flight_and_latest_state_wins(self):
@@ -1138,9 +1108,9 @@ class DisplayPacingTests(unittest.TestCase):
         self.assertGreaterEqual(times[2] - times[1], 0.09)
         ec4.q.close()
 
-    def test_modulated_parameters_wait_while_turning(self):
+    def test_modulated_parameters_keep_updating_while_turning(self):
         ec4 = SlowEC4(delay=0.0)
-        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none", display_quiet_ms=200),
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none", value_popup=False),
                    midi=ec4, osc_send=lambda a, v: None)
         b.update_from_params(parse_params(default_tree()))
         ec4.q.flush(3)
@@ -1149,9 +1119,10 @@ class DisplayPacingTests(unittest.TestCase):
             b.on_cc(0, 17, 40 + i)
             b.on_osc("/rnbo/inst/1/params/mix/normalized", i / 40)
             time.sleep(0.01)
-        self.assertEqual(ec4.sent, [])  # nothing went to the EC4 mid-turn
         ec4.q.flush(2)
-        self.assertEqual(ec4.sent, [(2, 18, round(19 / 40 * 127))])  # just the latest, afterwards
+        self.assertTrue(ec4.sent)
+        self.assertEqual(ec4.sent[-1], (2, 18, round(19 / 40 * 127)))  # the latest value arrives
+        self.assertNotIn(0, [ch for ch, cc, v in ec4.sent if cc == 17])  # never fed back to the knob
         self.assertEqual(b.feedback_counts.get("1/mix"), 20)
         ec4.q.close()
 
@@ -1162,43 +1133,6 @@ class DisplayPacingTests(unittest.TestCase):
         ec4.send_ccs([(0, 16, 5)])
         time.sleep(0.05)
         self.assertEqual(ec4.sent, [(0, 16, 5)])
-        ec4.q.close()
-
-    def test_nothing_drawn_while_a_knob_moves(self):
-        ec4 = SlowEC4(delay=0.0)
-        ec4.q.hold_display(0.2)
-        ec4.display_text(rm.DISPLAY_OVERLAY, 0, "x" * 80)
-        ec4.overlay_visible(False)
-        ec4.send_ccs([(0, 16, 9)])
-        time.sleep(0.1)
-        self.assertEqual(ec4.sysex, [])  # held
-        self.assertEqual(ec4.sent, [])  # values for the EC4 wait too
-        ec4.q.hold_display(0.2)  # still turning: hold extends
-        time.sleep(0.15)
-        self.assertEqual(ec4.sysex, [])
-        self.assertTrue(ec4.q.flush(2))
-        self.assertEqual(len(ec4.sysex), 2)  # drawn once the knob rested
-        self.assertEqual(ec4.sent, [(0, 16, 9)])
-        ec4.q.close()
-
-    def test_bridge_holds_display_during_turns(self):
-        ec4 = SlowEC4(delay=0.0)
-        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none", display_quiet_ms=300),
-                   midi=ec4, osc_send=lambda a, v: None)
-        b.update_from_params(parse_params(default_tree()))
-        b.on_sysex(report(15, 0))
-        ec4.q.flush(3)
-        ec4.sysex.clear()
-        t_last = 0.0
-        for v in range(30, 60):  # 0.3 s turn
-            b.on_cc(0, 17, v)
-            t_last = time.monotonic()
-            time.sleep(0.01)
-        b.on_sysex(report(15, 1))  # e.g. a group change asks for new names meanwhile
-        ec4.q.flush(3)
-        self.assertTrue(ec4.sysex)
-        self.assertGreaterEqual(min(t for t, _ in ec4.sysex) - t_last, 0.28)  # only after the rest
-        b._hide_overlay()
         ec4.q.close()
 
     def test_fast_turning_with_popup_stays_within_ec4_pace(self):
@@ -1223,37 +1157,7 @@ class DisplayPacingTests(unittest.TestCase):
         ec4.q.close()
 
 
-class OscPacerTests(unittest.TestCase):
-    def test_paces_per_parameter_and_keeps_last_value(self):
-        from oscpacer import OscPacer
-        sent = []
-        p = OscPacer(lambda a, v: sent.append((time.monotonic(), a, v)), 0.02)
-        t0 = time.monotonic()
-        for i in range(100):  # 100 steps in ~0.2 s on one knob, plus one other knob
-            p.submit("k", "/a", i / 100)
-            if i == 50:
-                p.submit("j", "/b", 0.5)
-            time.sleep(0.002)
-        self.assertTrue(p.flush(1))
-        a = [x for x in sent if x[1] == "/a"]
-        self.assertEqual(a[0][2], 0.0)  # first change goes out at once
-        self.assertLess(a[0][0] - t0, 0.01)
-        self.assertEqual(a[-1][2], 0.99)  # the final value is never lost
-        self.assertLess(len(a), 25)  # far fewer than 100
-        gaps = [b[0] - a_[0] for a_, b in zip(a, a[1:])]
-        self.assertGreaterEqual(min(gaps), 0.015)
-        self.assertEqual([x[2] for x in sent if x[1] == "/b"], [0.5])  # other knob not delayed by /a
-        p.close()
-
-    def test_interval_zero_sends_everything(self):
-        from oscpacer import OscPacer
-        sent = []
-        p = OscPacer(lambda a, v: sent.append(v), 0)
-        for i in range(10):
-            p.submit("k", "/a", i)
-        self.assertEqual(sent, list(range(10)))
-        p.close()
-
+class OscStatsTests(unittest.TestCase):
     def test_bridge_measures_runner_reply_time(self):
         osc = []
         b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none"), midi=FakeMidi(),
@@ -1265,6 +1169,47 @@ class OscPacerTests(unittest.TestCase):
         st = b.take_osc_stats()
         self.assertEqual((st["sent"], st["replies"]), (1, 1))
         self.assertGreaterEqual(st["lat_max"], 0.025)
+
+
+class ConfigTests(unittest.TestCase):
+    def own_ip(self):
+        import socket
+        for probe in ("192.0.2.1", "10.255.255.255"):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect((probe, 9))
+                ip = s.getsockname()[0]
+                if not ip.startswith("127.") and ip != "0.0.0.0":
+                    return ip
+            except OSError:
+                pass
+            finally:
+                s.close()
+        self.skipTest("no non-loopback address here")
+
+    def test_is_own_address(self):
+        from ec4bridge import is_own_address
+        self.assertFalse(is_own_address("127.0.0.1"))
+        self.assertFalse(is_own_address("192.0.2.1"))  # documentation range: never this machine
+        self.assertFalse(is_own_address("no-such-host.invalid"))
+        self.assertTrue(is_own_address(self.own_ip()))
+
+    def test_own_address_becomes_loopback_and_retired_keys_are_quiet(self):
+        from ec4bridge import load_config
+        ip = self.own_ip()
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "config.json")
+            with open(conf, "w") as f:
+                json.dump({"runner_host": ip, "display_quiet_ms": 400, "osc_send_interval_ms": 15,
+                           "listen_ip": "auto", "bogus": 1}, f)
+            with self.assertLogs("ec4bridge", level="INFO") as logs:
+                c = load_config(conf)
+        self.assertEqual(c["runner_host"], "127.0.0.1")
+        text = "\n".join(logs.output)
+        self.assertIn("using 127.0.0.1 instead", text)
+        self.assertIn("no longer used (you can delete them): display_quiet_ms, listen_ip, osc_send_interval_ms", text)
+        self.assertIn("unknown config keys ignored: bogus", text)
+        self.assertNotIn("display_quiet_ms", c)
 
 
 class CliTests(unittest.TestCase):
@@ -1379,7 +1324,6 @@ class TraceTests(unittest.TestCase):
                 path = ec4bridge.finish_trace(b)
             finally:
                 ec4bridge.TRACE_DIR = old
-                b._pacer.close()
             self.assertFalse(b.trace.active)
             with open(path) as f:
                 text = f.read()
@@ -1405,100 +1349,6 @@ class TraceTests(unittest.TestCase):
         self.assertIn("1 answered within 100 ms", text)
         self.assertIn("/rnbo/inst/0 x1 (so only this was stuck", text)
         self.assertIn("turned: 1/mix x1", text)
-
-    def test_runner_check_command(self):
-        runner = MockRunner()
-        try:
-            with tempfile.TemporaryDirectory() as d:
-                conf = os.path.join(d, "config.json")
-                with open(conf, "w") as f:
-                    json.dump({"oscquery_port": runner.port}, f)
-                cmd = [sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf,
-                       "runner-check", "--seconds", "1"]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertIn("answered quickly the whole time", r.stdout)
-                runner.delay = 0.3
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                self.assertIn("the runner took 3", r.stdout)
-                self.assertIn("cause is in the runner or the Pi", r.stdout)
-        finally:
-            runner.close()
-
-
-    def run_stress(self, cost):
-        """runner-stress against a mock runner that needs `cost` seconds per parameter change."""
-        import queue as q
-        from pythonosc.dispatcher import Dispatcher
-        from pythonosc.osc_server import BlockingOSCUDPServer
-        from pythonosc.udp_client import SimpleUDPClient
-        runner = MockRunner()
-        listeners, work, clients = [], q.Queue(), {}
-
-        def on(addr, *a):
-            if addr == "/rnbo/listeners/add":
-                listeners.append(a[0])
-            elif addr.endswith("/normalized"):
-                work.put((addr, a[0]))
-
-        def worker():
-            while True:
-                addr, v = work.get()
-                if addr is None:
-                    return
-                time.sleep(cost)
-                for li in listeners:
-                    if li not in clients:
-                        ip, port = li.rsplit(":", 1)
-                        clients[li] = SimpleUDPClient(ip, int(port))
-                    clients[li].send_message(addr, v)
-
-        disp = Dispatcher()
-        disp.set_default_handler(on)
-        osc = BlockingOSCUDPServer(("127.0.0.1", 0), disp)
-        threading.Thread(target=osc.serve_forever, daemon=True).start()
-        threading.Thread(target=worker, daemon=True).start()
-        try:
-            with tempfile.TemporaryDirectory() as d:
-                conf = os.path.join(d, "config.json")
-                with open(conf, "w") as f:
-                    json.dump({"oscquery_port": runner.port, "osc_port": osc.server_address[1],
-                               "listen_port": 39123}, f)
-                r = subprocess.run([sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf,
-                                    "runner-stress", "1/mix", "--rates", "10,60", "--seconds", "2"],
-                                   capture_output=True, text=True, timeout=60)
-            return r
-        finally:
-            work.put((None, None))
-            osc.server_close()
-            runner.close()
-
-    def test_runner_stress_keeps_up(self):
-        r = self.run_stress(0.002)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("Sweeping 1/mix (mix) on 'Delay'", r.stdout)
-        self.assertIn("kept up at every rate", r.stdout)
-
-    def test_runner_stress_falls_behind(self):
-        r = self.run_stress(0.03)  # at most ~33 changes a second
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("keeps up at 10 changes per second but falls behind at 60", r.stdout)
-        self.assertIn('"osc_send_interval_ms" to 100', r.stdout)
-
-    def test_runner_stress_lists_parameters(self):
-        runner = MockRunner()
-        try:
-            with tempfile.TemporaryDirectory() as d:
-                conf = os.path.join(d, "config.json")
-                with open(conf, "w") as f:
-                    json.dump({"oscquery_port": runner.port}, f)
-                r = subprocess.run([sys.executable, os.path.join(ROOT, "ec4bridge.py"), "-c", conf,
-                                    "runner-stress"], capture_output=True, text=True, timeout=30)
-            self.assertEqual(r.returncode, 1)
-            self.assertIn("1/mix", r.stdout)
-            self.assertIn("safe to sweep", r.stdout)
-        finally:
-            runner.close()
 
     def test_no_recording_when_idle(self):
         b = Bridge(cfg(), midi=FakeMidi())

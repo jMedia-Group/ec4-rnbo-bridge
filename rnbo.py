@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -77,43 +76,6 @@ def fetch_value(host: str, port: int, path: str, timeout: float = 1.0):
         if 400 <= exc.code < 500:  # no such node (servers differ in the exact code)
             return None
         raise
-
-
-def fetch_graph(host: str, port: int, known: dict[int, str] | None = None,
-                pause: float = 0.02, timeout: float = 5.0) -> dict:
-    """The parts of /rnbo/inst the bridge needs, read in small pieces.
-
-    Reading all of /rnbo/inst in one request makes the runner build the whole state of every
-    instance (presets, data, ports, ...) at once; with a big graph that takes seconds, during
-    which it doesn't apply incoming parameter changes. Reading each instance's name and
-    parameters separately, with a short pause in between, lets it keep up.
-    """
-    tree: dict = {"FULL_PATH": "/rnbo/inst", "CONTENTS": {}}
-    top = max(known, default=-1) if known else -1
-    misses, i = 0, 0
-    while misses < 8 or i <= top + 2:  # instance indexes can have gaps
-        name = fetch_value(host, port, f"/rnbo/inst/{i}/name")
-        if name is None:
-            misses += 1
-            i += 1
-            continue
-        misses = 0
-        alias = fetch_value(host, port, f"/rnbo/inst/{i}/config/name_alias") or ""
-        try:
-            params = fetch_tree(host, port, f"/rnbo/inst/{i}/params", timeout)
-        except urllib.error.HTTPError as exc:
-            if not 400 <= exc.code < 500:
-                raise
-            params = {"CONTENTS": {}}
-        tree["CONTENTS"][str(i)] = {"FULL_PATH": f"/rnbo/inst/{i}", "CONTENTS": {
-            "name": {"VALUE": [name]},
-            "config": {"CONTENTS": {"name_alias": {"VALUE": [alias]}}},
-            "params": params,
-        }}
-        if pause:
-            time.sleep(pause)
-        i += 1
-    return tree
 
 
 def graph_signature(host: str, port: int, known: dict[int, str]) -> tuple:

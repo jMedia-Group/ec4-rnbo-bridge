@@ -73,7 +73,6 @@ class OutQueue:
         self._vis_desired: bool | None = None
         self._vis_sent: bool | None = None
         self._await_until = 0.0  # waiting for the EC4's reply to a display message until then
-        self._hold_until = 0.0   # no display messages until then (a knob is being turned)
         self.display_messages = 0  # for tests / diagnostics
         self.stats = {"cc": 0, "sysex": 0, "display": 0}  # messages written (diagnostics)
         self._thread = threading.Thread(target=self._run, name="ec4-midi-out", daemon=True)
@@ -111,14 +110,6 @@ class OutQueue:
                 self._shadow[d] = None
             if visibility or display is None:
                 self._vis_sent = None
-            self._cond.notify()
-
-    def hold_display(self, seconds: float):
-        """A knob is moving: send nothing to the EC4 for `seconds` (it stops reading its
-        encoders while it processes incoming data, especially drawing). Called on every turn,
-        so it lasts until the knob rests; queued values are coalesced and go out afterwards."""
-        with self._cond:
-            self._hold_until = max(self._hold_until, time.monotonic() + seconds)
             self._cond.notify()
 
     def ack(self):
@@ -173,23 +164,13 @@ class OutQueue:
                     if self._stop:
                         return
                     now = time.monotonic()
-                    held = now < self._hold_until
-                    disp_at = max(self._await_until, self._hold_until)
                     pending = self._display_pending()
-                    if (self._items and not held) or (pending and now >= disp_at):
+                    if self._items or (pending and now >= self._await_until):
                         break
-                    deadlines = []
-                    if self._items and held:
-                        deadlines.append(self._hold_until)
-                    if pending:
-                        deadlines.append(disp_at)
-                    self._cond.wait(max(0.0, min(deadlines) - now) if deadlines else None)
-                if time.monotonic() >= self._hold_until:
-                    batch, self._items = coalesce(self._items), []
-                else:
-                    batch = []
+                    self._cond.wait(max(0.0, self._await_until - now) if pending else None)
+                batch, self._items = coalesce(self._items), []
                 disp = None
-                if time.monotonic() >= max(self._await_until, self._hold_until):
+                if time.monotonic() >= self._await_until:
                     disp = self._next_display_message()
                     if disp is not None:
                         self._await_until = time.monotonic() + self.ack_timeout

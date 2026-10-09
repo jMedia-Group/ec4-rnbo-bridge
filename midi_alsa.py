@@ -142,9 +142,6 @@ class EC4Midi:
         if self._device:
             self._queue.set_visible(visible)
 
-    def hold_display(self, seconds: float):
-        self._queue.hold_display(seconds)
-
     def take_stats(self) -> dict:
         """Messages written to / received from the EC4 since the last call."""
         s = dict(self._queue.stats)

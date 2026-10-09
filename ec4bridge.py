@@ -15,8 +15,6 @@ Subcommands:
   test-display     check that the EC4 accepts live display text (firmware 2.0+)
   monitor          show what the EC4 sends as you turn encoders (timing, skipped steps)
   trace            record what the running bridge does for a few seconds, and where it lags
-  runner-check     time small requests to the runner, to see whether it freezes on its own
-  runner-stress    sweep one parameter over OSC at a few rates and time how well the runner keeps up
 """
 
 from __future__ import annotations
@@ -37,9 +35,8 @@ import urllib.error
 import ec4_remote
 import ec4_sysex
 from layout import Layout, Slot, build_layout, format_table
-from oscpacer import OscPacer
 from ec4trace import Trace, analyze, format_events
-from rnbo import Param, fetch_graph, graph_signature, instance_names, parse_params
+from rnbo import Param, fetch_tree, graph_signature, instance_names, parse_params
 
 log = logging.getLogger("ec4bridge")
 
@@ -48,7 +45,6 @@ DEFAULTS = {
     "oscquery_port": 5678,
     "osc_port": 1234,
     "listen_port": 9123,
-    "listen_ip": "auto",
     "midi_port": "EC4",
     "ec4_setup": 16,
     "setup_name": "RNBO",
@@ -57,7 +53,6 @@ DEFAULTS = {
     "display": "",
     "cc_base": 16,
     "poll_interval": 2.0,
-    "full_refresh_interval": 0,
     "feedback_holdoff_ms": 1000,
     "new_group_per_instance": True,
     "include": [],
@@ -74,15 +69,9 @@ DEFAULTS = {
     "pause_file": "ec4bridge.pause",
     "sysex_page_pause_ms": 2,
     "live_names": True,
-    "live_names_refresh": 0,
     "zero_unused": True,
     "value_popup": True,
     "value_popup_seconds": 1.5,
-    "value_popup_mode": "rest",
-    "value_popup_rest_ms": 120,
-    "value_popup_interval_ms": 250,
-    "display_quiet_ms": 400,
-    "osc_send_interval_ms": 15,
     "units": {},
     "notify_graph_change": True,
     "notify_seconds": 2.5,
@@ -106,13 +95,22 @@ def parse_list_key(key: str):
     return None
 
 
+# settings from earlier versions that no longer do anything (no warning, just a note)
+RETIRED_KEYS = {"listen_ip", "full_refresh_interval", "live_names_refresh", "value_popup_mode",
+                "value_popup_rest_ms", "value_popup_interval_ms", "display_quiet_ms",
+                "osc_send_interval_ms"}
+
+
 def load_config(path: str | None) -> dict:
     cfg = dict(DEFAULTS)
     base = os.path.dirname(os.path.abspath(path)) if path else os.getcwd()
     if path and os.path.exists(path):
         with open(path) as f:
             user = json.load(f)
-        unknown = set(user) - set(DEFAULTS) - {"_comment"}
+        retired = set(user) & RETIRED_KEYS
+        if retired:
+            log.info("config keys no longer used (you can delete them): %s", ", ".join(sorted(retired)))
+        unknown = set(user) - set(DEFAULTS) - RETIRED_KEYS - {"_comment"}
         if unknown:
             log.warning("unknown config keys ignored: %s", ", ".join(sorted(unknown)))
         cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
@@ -147,9 +145,6 @@ def load_config(path: str | None) -> dict:
     key = cfg["device_list_key"] = str(cfg["device_list_key"] or "off").strip().lower().replace(" ", "")
     if parse_list_key(key) is None and key != "off":
         raise SystemExit('device_list_key must be "shift+1".."shift+16", "user1".."user4" or "off"')
-    cfg["value_popup_mode"] = str(cfg["value_popup_mode"] or "rest").strip().lower()
-    if cfg["value_popup_mode"] not in ("rest", "live"):
-        raise SystemExit('value_popup_mode must be "rest" or "live"')
     cfg["device_list_mode"] = str(cfg["device_list_mode"] or "momentary").strip().lower()
     if cfg["device_list_mode"] not in ("momentary", "toggle"):
         raise SystemExit('device_list_mode must be "momentary" or "toggle"')
@@ -162,7 +157,30 @@ def load_config(path: str | None) -> dict:
     top = 31 if cfg["resolution"] == "14bit" else 127
     if not 0 <= int(cfg["cc_base"]) <= top - 15:
         raise SystemExit(f"cc_base must be 0..{top - 15} for {cfg['resolution']} mode")
+    if is_own_address(cfg["runner_host"]):
+        # the runner is on this Pi: going through its network address instead of 127.0.0.1
+        # made the runner stall for seconds at a time on parameter changes
+        log.info("runner_host %s is this computer; using 127.0.0.1 instead", cfg["runner_host"])
+        cfg["runner_host"] = "127.0.0.1"
     return cfg
+
+
+def is_own_address(host: str) -> bool:
+    """True if host is one of this computer's own network addresses (not loopback)."""
+    try:
+        ip = socket.gethostbyname(str(host))
+    except OSError:
+        return False
+    if ip.startswith("127."):
+        return False
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind((ip, 0))  # only works for an address that belongs to this machine
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 def local_ip_for(host: str) -> str:
@@ -177,7 +195,7 @@ def local_ip_for(host: str) -> str:
 
 
 def fetch_params(cfg: dict) -> list[Param]:
-    return parse_params(fetch_graph(cfg["runner_host"], cfg["oscquery_port"]))
+    return parse_params(fetch_tree(cfg["runner_host"], cfg["oscquery_port"], timeout=10))
 
 
 class Bridge:
@@ -212,16 +230,10 @@ class Bridge:
         self._polled: dict[str, float] = {}  # normalized values seen in the last poll
         self._sent_cc: dict[tuple[int, int], tuple[int, float]] = {}  # what we last sent the EC4
         self.feedback_counts: dict[str, int] = {}  # values sent back to the EC4, per parameter
-        # changes to the runner: paced per parameter, and timed until the runner reports them back
-        self._pacer = OscPacer(self._osc_out, float(cfg.get("osc_send_interval_ms", 15)) / 1000.0) \
-            if osc_send else None
+        # changes sent to the runner, timed until it reports them back (stats in the log)
         self._sent_at: dict[str, tuple[float, float]] = {}
         self.osc_stats = {"sent": 0, "replies": 0, "lat_sum": 0.0, "lat_max": 0.0}
         self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
-        self._popup_pending: tuple[Slot, object] | None = None
-        self._popup_last = 0.0
-        self._last_turn = 0.0  # when any encoder last moved
-        self._popup_timer: threading.Timer | None = None
         self._overlay_visible = False
         self._overlay_owner = None
         self._overlay_lines: list[str] = [""] * 4
@@ -491,42 +503,15 @@ class Bridge:
         return [p.label[:20], value[:20], bar, device[:20]]
 
     def value_popup(self, slot: Slot, raw):
-        """Full parameter name, value, bar and device on the overlay.
+        """Full parameter name, value, bar and device on the overlay, updated as you turn.
 
-        The EC4 stops sending encoder data while it draws, so by default ("rest") the pop-up
-        is only drawn once the knob pauses; "live" redraws at most every value_popup_interval_ms
-        while turning.
+        Only the screen contents are set here; the MIDI layer sends just the characters that
+        changed, one message at a time as the EC4 is ready, so fast turns don't flood it.
         """
         if not self.cfg.get("value_popup", True) or self._list_held:
             return
         if not self.on_my_setup() or self.paused() or self.midi is None:
             return
-        self._popup_pending = (slot, raw)
-        self._popup_tick()
-
-    def _popup_due(self) -> float:
-        if self.cfg.get("value_popup_mode", "rest") == "rest":
-            return self._last_turn + float(self.cfg.get("value_popup_rest_ms", 120)) / 1000.0
-        return self._popup_last + float(self.cfg.get("value_popup_interval_ms", 250)) / 1000.0
-
-    def _popup_tick(self, from_timer: bool = False):
-        if self._popup_pending is None:
-            return
-        wait = self._popup_due() - time.monotonic()
-        if wait <= 0:
-            self._flush_popup()
-        elif from_timer or not (self._popup_timer and self._popup_timer.is_alive()):
-            # (inside the timer's own callback it still counts as alive, so always re-arm there)
-            self._popup_timer = threading.Timer(wait, self._popup_tick, kwargs={"from_timer": True})
-            self._popup_timer.daemon = True
-            self._popup_timer.start()
-
-    def _flush_popup(self):
-        pending, self._popup_pending = self._popup_pending, None
-        if pending is None or self._list_held:
-            return
-        self._popup_last = time.monotonic()
-        slot, raw = pending
         lines = self.value_popup_lines(slot, raw)
         secs = float(self.cfg["value_popup_seconds"])
         owner = ("value", slot.param.key)
@@ -672,14 +657,14 @@ class Bridge:
                 return
             k = slot.param.key
             self.values[k] = norm
-            self.touched[k] = self._last_turn = time.monotonic()
+            self.touched[k] = time.monotonic()
             addr = slot.param.address
         self.trace.add("set", k, addr, norm)
-        hold = getattr(self.midi, "hold_display", None) if self.midi is not None else None
-        if hold:  # nothing is drawn on the EC4 until the knob has rested this long
-            hold(float(self.cfg.get("display_quiet_ms", 400)) / 1000.0)
-        if self._pacer:
-            self._pacer.submit(k, addr, float(norm))
+        if self.osc_send:
+            try:
+                self._osc_out(addr, float(norm))
+            except OSError as exc:
+                log.warning("could not send to the runner: %s", exc)
         # show the name and value right away (a linear estimate); the runner's exact value
         # replaces it as soon as it comes back over OSC
         self.value_popup(slot, slot.param.approx_value(norm))
@@ -874,7 +859,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
     server = BlockingOSCUDPServer(("0.0.0.0", int(cfg["listen_port"])), disp)
     threading.Thread(target=server.serve_forever, name="osc-in", daemon=True).start()
 
-    ip = cfg["listen_ip"] if cfg["listen_ip"] != "auto" else local_ip_for(cfg["runner_host"])
+    ip = local_ip_for(cfg["runner_host"])
     listener = f"{ip}:{cfg['listen_port']}"
 
     if stop is None:
@@ -884,13 +869,10 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         signal.signal(signal.SIGUSR1, lambda *_: start_trace(bridge, float(cfg["trace_seconds"])))
 
     runner_ok = False
-    need_full = True  # read the whole graph (expensive for the runner) only when it changed
+    need_full = True  # read the whole graph only at start and when it changed
     signature = None
     known: dict[int, str] = {}
-    last_full = 0.0
-    last_refresh = time.monotonic()
     last_stats = time.monotonic()
-    slow_logged = 0.0
     log.info("bridge started; runner %s, EC4 match '%s', setup %s, %s",
              cfg["runner_host"], cfg["midi_port"], cfg["ec4_setup"], cfg["resolution"])
     while not stop.is_set():
@@ -913,24 +895,15 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
                 if sig_now != signature:
                     log.info("graph changed; reading it from the runner")
                     need_full = True
-            full_every = float(cfg["full_refresh_interval"] or 0)
-            if full_every and time.monotonic() - last_full >= full_every:
-                need_full = True
             params = None
             if need_full:
                 t_poll = time.monotonic()
-                tree = fetch_graph(host, port, known)
+                tree = fetch_tree(host, port, timeout=10)
                 bridge.trace.add("http", "graph read", time.monotonic() - t_poll)
                 params = parse_params(tree)
                 known = instance_names(tree)
                 signature = graph_signature(host, port, known)
                 need_full = False
-                last_full = time.monotonic()
-                took = last_full - t_poll
-                if took > 0.25 and time.monotonic() - slow_logged > 60:
-                    slow_logged = time.monotonic()
-                    log.info("reading the graph from the runner took %d ms (%d parameters, in small "
-                             "pieces); this only happens when the graph changes", took * 1000, len(params))
             if not runner_ok:
                 log.info("runner reachable; registering OSC listener %s", listener)
                 client.send_message("/rnbo/listeners/add", listener)
@@ -967,10 +940,6 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
                              span, st["received_cc"], st["cc"], st["display"], st["sysex"],
                              f"; most updated: {busiest}" if busiest else "",
                              f"; input overflows so far: {st['overruns']}" if st["overruns"] else "")
-            refresh = float(cfg["live_names_refresh"] or 0)
-            if refresh and time.monotonic() - last_refresh >= refresh:
-                last_refresh = time.monotonic()
-                bridge.write_names()
         except (urllib.error.URLError, OSError, ValueError) as exc:
             if runner_ok:
                 log.warning("runner not reachable: %s", exc)
@@ -1298,192 +1267,6 @@ def _service_pid() -> int | None:
         return None
 
 
-def cmd_runner_check(cfg: dict, args) -> int:
-    """Time tiny requests to the runner, to see whether it freezes by itself."""
-    from rnbo import fetch_value
-    host, port = cfg["runner_host"], cfg["oscquery_port"]
-    secs, every = float(args.seconds), 0.25
-    path = "/rnbo/jack/info/cpu_load"
-    try:
-        xruns0 = fetch_value(host, port, "/rnbo/jack/info/xrun_count", timeout=15)
-    except (urllib.error.URLError, OSError) as exc:
-        print(f"Could not reach the runner at {host}:{port}: {exc}")
-        return 1
-    if _service_pid():
-        print("Note: the bridge service is running. For a clean result stop it first:\n"
-              "  sudo systemctl stop ec4bridge\n")
-    print(f"Asking the runner for one small value every {every} s for {secs:.0f} s.")
-    print("Don't touch anything (close the RNBO web interface too). Answers slower than 200 ms:\n")
-    times, slow = [], []
-    end = time.monotonic() + secs
-    while time.monotonic() < end:
-        t = time.monotonic()
-        try:
-            fetch_value(host, port, path, timeout=30)
-            err = ""
-        except (urllib.error.URLError, OSError) as exc:
-            err = f" (error: {exc})"
-        dt = time.monotonic() - t
-        times.append(dt)
-        if dt > 0.2 or err:
-            slow.append(dt)
-            print(f"  {time.strftime('%H:%M:%S')}  the runner took {dt * 1000:.0f} ms to answer{err}", flush=True)
-        time.sleep(max(0.0, every - dt))
-    try:
-        xruns1 = fetch_value(host, port, "/rnbo/jack/info/xrun_count", timeout=15)
-    except (urllib.error.URLError, OSError):
-        xruns1 = None
-    times.sort()
-    print(f"\n{len(times)} requests: typical {times[len(times) // 2] * 1000:.0f} ms, "
-          f"slowest {times[-1] * 1000:.0f} ms, {len(slow)} slower than 200 ms")
-    if isinstance(xruns0, (int, float)) and isinstance(xruns1, (int, float)):
-        print(f"audio dropouts (JACK xruns) meanwhile: {int(xruns1 - xruns0)}")
-    if slow:
-        print("The runner froze with nothing else going on, so the cause is in the runner or the Pi, "
-              "not the EC4 or the bridge.")
-    else:
-        print("The runner answered quickly the whole time: on its own it doesn't freeze.")
-    return 0
-
-
-def _stress_rate(client, p: Param, rate: float, seconds: float, replies: list, lock) -> dict:
-    """Sweep one parameter at `rate` changes per second; time the runner's reports."""
-    tol = max(1e-3, 0.5 / (p.steps - 1) + 1e-3) if p.steps and p.steps > 1 else 1e-3
-    with lock:
-        replies.clear()
-    sends = []
-    interval = 1.0 / rate
-    t_start = time.monotonic()
-    for i in range(max(1, int(seconds * rate))):
-        ph = (i * interval / 4.0) % 1.0  # a slow triangle between 0.2 and 0.8, 4 s per sweep
-        v = round(0.2 + 0.6 * (2 * ph if ph < 0.5 else 2 - 2 * ph), 5)
-        t = time.monotonic()
-        client.send_message(p.address, v)
-        sends.append((t, v))
-        time.sleep(max(0.0, t_start + (i + 1) * interval - time.monotonic()))
-    t_end = time.monotonic()
-    # wait for late reports: until the runner has been quiet for 1 s (at most 10 s)
-    while time.monotonic() - t_end < 10:
-        with lock:
-            last = replies[-1][0] if replies else t_end
-        if time.monotonic() - max(last, t_end) > 1.0:
-            break
-        time.sleep(0.1)
-    with lock:
-        got = list(replies)
-    lats, missing = [], 0
-    j = 0
-    for t, v in sends:
-        while j < len(got) and got[j][0] < t:
-            j += 1
-        r = next((r for r in got[j:] if abs(r[1] - v) <= tol), None)
-        if r is None:
-            missing += 1
-        else:
-            lats.append(r[0] - t)
-    # longest stretch with no report at all while changes were going out
-    inside = [t_start] + [r[0] for r in got if t_start <= r[0] <= t_end] + [t_end]
-    silence = max(b - a for a, b in zip(inside, inside[1:]))
-    lats.sort()
-    return {"rate": rate, "sent": len(sends), "answered": len(lats), "missing": missing,
-            "typical": lats[len(lats) // 2] if lats else None, "slowest": lats[-1] if lats else None,
-            "slow": sum(1 for x in lats if x > 0.2), "silence": silence}
-
-
-def cmd_runner_stress(cfg: dict, args) -> int:
-    """Sweep one parameter over OSC at a few rates, without the EC4 or the bridge, and report
-    how quickly the runner keeps up."""
-    from pythonosc.dispatcher import Dispatcher
-    from pythonosc.osc_server import BlockingOSCUDPServer
-    from pythonosc.udp_client import SimpleUDPClient
-    host = cfg["runner_host"]
-    try:
-        params = parse_params(fetch_graph(host, cfg["oscquery_port"]))
-    except (urllib.error.URLError, OSError) as exc:
-        print(f"Could not reach the runner at {host}:{cfg['oscquery_port']}: {exc}")
-        return 1
-    p = next((x for x in params if args.param in (x.key, f"{x.inst}/{x.label}")), None) if args.param else None
-    if p is None:
-        if args.param:
-            print(f"No parameter '{args.param}'.")
-        print("Pick a parameter that's safe to sweep (it moves between 20% and 80% and is set back "
-              "afterwards), e.g.:  venv/bin/python ec4bridge.py runner-stress 1/mix\n")
-        for x in params[:40]:
-            print(f"  {x.key:<28} {x.label}  ({x.inst_name})")
-        if len(params) > 40:
-            print(f"  ... and {len(params) - 40} more")
-        return 1
-    if _service_pid() and not args.force:
-        print("Stop the bridge first, so only this test talks to the runner:\n"
-              "  sudo systemctl stop ec4bridge")
-        return 1
-    try:
-        rates = [float(r) for r in args.rates.split(",") if r.strip()]
-    except ValueError:
-        print("--rates must look like 10,30,60")
-        return 1
-
-    replies: list[tuple[float, float]] = []
-    lock = threading.Lock()
-
-    def on_osc(address, *a):
-        if address == p.address and a:
-            try:
-                v = float(a[0])
-            except (TypeError, ValueError):
-                return
-            with lock:
-                replies.append((time.monotonic(), v))
-
-    disp = Dispatcher()
-    disp.set_default_handler(on_osc)
-    port = int(args.listen_port or (int(cfg["listen_port"]) + 1))
-    server = BlockingOSCUDPServer(("0.0.0.0", port), disp)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    ip = cfg["listen_ip"] if cfg["listen_ip"] != "auto" else local_ip_for(host)
-    listener = f"{ip}:{port}"
-    client = SimpleUDPClient(host, int(cfg["osc_port"]))
-    client.send_message("/rnbo/listeners/add", listener)
-    time.sleep(0.5)
-    secs = float(args.seconds)
-    print(f"Sweeping {p.key} ({p.label}) on '{p.inst_name}' for {secs:.0f} s at each of "
-          f"{', '.join(f'{r:g}' for r in rates)} changes per second. It changes the sound and is set "
-          f"back afterwards. Don't touch anything meanwhile.\n")
-    results = []
-    try:
-        for rate in rates:
-            r = _stress_rate(client, p, rate, secs, replies, lock)
-            results.append(r)
-            ms = lambda x: "-" if x is None else f"{x * 1000:.0f} ms"  # noqa: E731
-            print(f"{rate:>5g}/s: sent {r['sent']}, reported back {r['answered']}; typical {ms(r['typical'])}, "
-                  f"slowest {ms(r['slowest'])}, {r['slow']} slower than 200 ms; longest silence "
-                  f"{ms(r['silence'])}", flush=True)
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        print("stopped")
-    finally:
-        client.send_message(p.address, float(p.normalized))
-        client.send_message("/rnbo/listeners/del", listener)
-        server.server_close()
-    bad = [r for r in results if (r["slowest"] or 0) > 0.5 or r["silence"] > 0.5 or not r["answered"]]
-    print()
-    if not results:
-        return 1
-    if not bad:
-        print("The runner kept up at every rate. Without the bridge it doesn't freeze, so the freezes "
-              "need something else the bridge does at the same time; send me this output.")
-    elif bad[0] is not results[0]:
-        ok = results[results.index(bad[0]) - 1]["rate"]
-        print(f"The runner keeps up at {ok:g} changes per second but falls behind at "
-              f"{bad[0]['rate']:g}. Setting \"osc_send_interval_ms\" to {int(1000 / ok)} "
-              f"or more should stop the freezes.")
-    else:
-        print("The runner freezes even from this simple test, with no EC4 and no bridge involved: the "
-              "problem is in the runner (or the Pi). This output is a good reproduction to send to "
-              "Cycling '74.")
-    return 0
-
-
 def cmd_trace(cfg: dict, args) -> int:
     """Ask the running bridge to record a timeline, then print its summary."""
     import glob
@@ -1534,15 +1317,6 @@ def main(argv=None) -> int:
     sub.add_parser("test-display", help="check live display text on the EC4")
     sub.add_parser("monitor", help="show what the EC4 sends, with timing")
     sub.add_parser("trace", help="record what the running bridge does for a few seconds, and where it lags")
-    p = sub.add_parser("runner-check", help="check whether the runner freezes on its own")
-    p.add_argument("--seconds", type=float, default=60)
-    p = sub.add_parser("runner-stress", help="sweep one parameter over OSC (no EC4, no bridge) and "
-                                             "time how well the runner keeps up")
-    p.add_argument("param", nargs="?", help="parameter key, e.g. 1/mix (omit to list them)")
-    p.add_argument("--rates", default="10,30,60", help="changes per second to try (default 10,30,60)")
-    p.add_argument("--seconds", type=float, default=15, help="seconds per rate (default 15)")
-    p.add_argument("--listen-port", type=int, default=0)
-    p.add_argument("--force", action="store_true", help="run even if the bridge is running")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1551,8 +1325,7 @@ def main(argv=None) -> int:
     return {
         "run": cmd_run, "list": cmd_list, "capture-backup": cmd_capture_backup,
         "make-syx": cmd_make_syx, "send-layout": cmd_send_layout, "test-display": cmd_test_display, "monitor": cmd_monitor,
-        "trace": cmd_trace, "runner-check": cmd_runner_check,
-        "runner-stress": cmd_runner_stress,
+        "trace": cmd_trace,
     }[args.cmd](cfg, args)
 
 

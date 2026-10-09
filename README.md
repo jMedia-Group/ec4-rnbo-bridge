@@ -113,10 +113,9 @@ polysynth
 
 The value is RNBO's real value, as reported back by the runner (enums show their label), with
 its unit: set it on the parameter in your patch (`param cutoff @unit Hz`), or in `units` in
-`config.json`. It
-appears as soon as the knob pauses (the EC4 can't send knob data while it's drawing, so
-nothing is drawn while you turn) and disappears 1.5 s later (`value_popup`,
-`value_popup_mode`, `value_popup_seconds`).
+`config.json`. It follows the knob as you turn and disappears 1.5 s after you stop
+(`value_popup`, `value_popup_seconds`). Only the characters that change are sent, one message
+at a time as the EC4 is ready, so fast turns never flood it.
 
 To check, run `venv/bin/python ec4bridge.py test-display` with the EC4 on the RNBO setup. It asks
 the EC4 which setup it's on, shows a test message for 4 seconds, then writes `T01`…`T16` as encoder
@@ -160,7 +159,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 
 | key | default | meaning |
 |---|---|---|
-| `runner_host` | `127.0.0.1` | runner address (the bridge can also run on another machine) |
+| `runner_host` | `127.0.0.1` | runner address. Keep `127.0.0.1` when the bridge runs on the same Pi as the runner: going through the Pi's network address made the runner stall for seconds on parameter changes, so the bridge switches such an address to `127.0.0.1` itself. (The bridge can also run on another machine.) |
 | `oscquery_port` / `osc_port` | 5678 / 1234 | runner ports |
 | `listen_port` | 9123 | UDP port the runner sends value changes to |
 | `midi_port` | `EC4` | text to match in the ALSA port name |
@@ -188,16 +187,11 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `notify_group_change` | `true` | pop up the instance name when you switch groups |
 | `value_popup` | `true` | while you turn an encoder, show its full name, value, a level bar and the device |
 | `units` | `{}` | units shown after values in the pop-up, keyed like `names` (`{"0/cutoff": "Hz", "attack": "ms"}`); overrides the unit from RNBO |
-| `value_popup_mode` | `rest` | `rest`: draw the pop-up once the knob pauses (`value_popup_rest_ms`, 120); `live`: also redraw while turning, at most every `value_popup_interval_ms` (250). The EC4 stops sending knob data while it draws, so `live` makes knobs less smooth |
-| `osc_send_interval_ms` | 15 | at most one change per parameter is sent to the runner in this time (the newest value; the last value of a turn is never lost). 0 = send every step |
-| `display_quiet_ms` | 400 | while a knob moves and until it has been still this long, nothing is sent to the EC4 (values of other parameters, pop-ups, names); it catches up afterwards. The EC4 stops reading its knobs while it handles incoming data, so this keeps turns smooth |
 | `value_popup_seconds` | 1.5 | how long that stays after you stop turning |
 | `zero_unused` | `true` | set every encoder without a parameter to 0 (on a new graph, at start-up and when you return to the RNBO setup), so no values are left over from the previous graph |
-| `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |
 | `feedback_holdoff_ms` | 1000 | after you turn an encoder, ignore the runner's reports for it this long, so a late report can't snap the knob back |
 | `poll_interval` | 2.0 | seconds between quick checks for a graph change (set name and device names only; cheap for the runner) |
-| `full_refresh_interval` | 0 | also re-read the whole graph every N seconds (0 = only when it changed). Reading a big graph can keep the runner busy for seconds, which makes the sound stutter |
 
 **14-bit mode** uses the EC4's 14-bit CC type (CC 16–31 plus LSB on CC 48–63) for smooth
 filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, or a
@@ -206,30 +200,26 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
 ## Troubleshooting
 
 - **Knobs lag, jump or skip steps**:
-  1. In the RNBO web interface, make sure the EC4 isn't also controlling the patch directly:
+  1. If the runner is on the same Pi, `runner_host` must be `127.0.0.1` (the default). The log
+     says "using 127.0.0.1 instead" if it corrected a network address for you. Check with
+     `curl -s http://127.0.0.1:5678/rnbo/listeners/entries` that the bridge is registered as
+     `127.0.0.1:9123`; remove old entries (e.g. `192.168.x.x:9123`) by sending
+     `/rnbo/listeners/del` with that address to port 1234.
+  2. In the RNBO web interface, make sure the EC4 isn't also controlling the patch directly:
      remove its connection to instances in the Graph view and delete any MIDI mappings that use
      its CCs (MIDI Mappings view). Two paths to the same parameter fight each other.
-  2. Run `venv/bin/python ec4bridge.py monitor` and turn a knob slowly. Steps of more than 1
+  3. Run `venv/bin/python ec4bridge.py monitor` and turn a knob slowly. Steps of more than 1
      mean the EC4 itself is skipping: that's acceleration, set `"encoder_mode": "Acc0"` and run
      `send-layout`. For finer control use `"resolution": "14bit"` (plus `send-layout`).
-  3. Make sure `feedback_holdoff_ms` is at least 1000 (older example configs had 250).
-  4. Close the RNBO web interface in your browser while playing; it adds load on the Pi.
-  5. Record a trace while the problem happens: run `venv/bin/python ec4bridge.py trace` (with the
+  4. Make sure `feedback_holdoff_ms` is at least 1000 (older example configs had 250).
+  5. Close the RNBO web interface in your browser while playing; it adds load on the Pi.
+  6. Record a trace while the problem happens: run `venv/bin/python ec4bridge.py trace` (with the
      service running) and turn knobs for 20 seconds. It times every stage of each turn separately:
      the EC4 sending, the bridge passing it on, the runner applying it. The summary then says
      which stage stalls, and whether something other than the bridge is also changing the
      parameters. The full timeline is saved as `trace-<date>.txt` in this folder. Without the
      command: `sudo systemctl kill -s USR1 ec4bridge`, then `journalctl -u ec4bridge -n 30`.
      `trace_seconds` (default 20) sets the length.
-  6. If the trace shows the runner taking seconds to report changes back, check whether it freezes
-     on its own: stop the bridge (`sudo systemctl stop ec4bridge`), close the web interface, and run
-     `venv/bin/python ec4bridge.py runner-check` (60 s; `--seconds N` to change). It asks the runner
-     for one small value every 0.25 s and prints every answer slower than 200 ms, with the time.
-  7. To see how many parameter changes per second the runner can take, with no EC4 and no bridge
-     involved: stop the bridge and run `venv/bin/python ec4bridge.py runner-stress 1/mix` (any
-     parameter key from `list`; run it without one to see them). It sweeps that parameter between
-     20% and 80% at 10, 30 and 60 changes a second (`--rates`), 15 s each (`--seconds`), sets it
-     back, and says at which rate the runner falls behind and what `osc_send_interval_ms` to use.
 
 - **"Receive error" on the EC4 during `send-layout`**: something else reached the EC4 in the middle
   of the dump. `send-layout` and `capture-backup` pause a running bridge service automatically

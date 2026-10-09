@@ -127,7 +127,7 @@ def analyze(events: list[tuple], params: dict[str, tuple[str, int]] | None = Non
     if reasons:
         out.append("knob messages ignored: " + ", ".join(f"{n} ({r})" for r, n in reasons.items()))
 
-    # ---- bridge -> runner: wait in the pacer --------------------------------------------
+    # ---- bridge -> runner: time inside the bridge -----------------------------------------
     waits = []
     outs_by_addr: dict[str, list[tuple]] = {}
     for e in outs:
