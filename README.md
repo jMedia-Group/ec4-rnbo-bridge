@@ -92,7 +92,8 @@ on** (or after updating from a version without live names).
 - **When you switch groups** on the EC4, it tells the bridge, which writes that group's names
   and pops up the instance's full name (and "page 2 of 3" if it spans several groups).
 - **Group names** (the 4×4 matrix shown while choosing a group) can't be written live; they come
-  from the last `send-layout`. The pop-up is there to make up for that.
+  from the last `send-layout`. The pop-up is there to make up for that. If your graphs differ a
+  lot, `"group_title_style": "number"` stores `G01`…`G16`, which never go out of date.
 - **When you switch to one of your other setups**, the bridge pauses: those encoders don't
   touch RNBO and the bridge doesn't send them values. Coming back resends values and names.
 
@@ -137,9 +138,11 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `encoder_mode` | `Acc1` | EC4 acceleration: `Acc0`–`Acc3`, `Div2/4/8`, `LSp2/4/6` |
 | `cc_base` | 16 | first CC number (CCs 16–31) |
 | `new_group_per_instance` | true | start each instance on a fresh group |
+| `hide_devices` | `[]` | devices (RNBO instances) to leave off the EC4 entirely. Digits = instance number (`"2"`); anything else matches the device name, ignoring case and `strip_prefixes` (`"reverb"`, `"^mixer$"`). `list` shows what's hidden |
 | `include` / `exclude` | `[]` | regexes matched against `inst/param-id` and the display name |
 | `names` | `{}` | 4-char overrides, keyed by `"0/cutoff"` or just `"cutoff"` |
 | `group_names` | `{}` | group name per instance index, e.g. `{"0": "Syn"}` |
+| `group_title_style` | `instance` | group titles stored on the EC4: `instance` (from the instance name, e.g. `pol1`; uses `group_names`), `number` (`G01`…`G16`, right for any graph; `group_names` is ignored), `blank` |
 | `name_case` | `keep` | capitalization of shortened names: `keep` (as written in RNBO), `title` (`Cutf`), `upper` (`CUTF`), `lower` (`cutf`). Names you type in `names`/`group_names` are always used exactly as typed |
 | `live_names` | `true` | write names onto the EC4 display live (firmware 2.0+) |
 | `notify_graph_change` | `true` | pop up a short message on the EC4 when a new graph loads |

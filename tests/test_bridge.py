@@ -14,7 +14,7 @@ sys.path.insert(0, HERE)
 
 import ec4_sysex as sx  # noqa: E402
 from ec4bridge import DEFAULTS, Bridge  # noqa: E402
-from layout import abbreviate, build_layout  # noqa: E402
+from layout import abbreviate, build_layout, format_table  # noqa: E402
 from mock_runner import MockRunner, default_tree  # noqa: E402
 from rnbo import parse_params  # noqa: E402
 
@@ -180,6 +180,44 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual([s.short for s in lay.slots], ["size", "decy"])
         lay = build_layout(parse_params(tree), cfg())
         self.assertEqual(lay.group_names[0], "jre")  # without the option
+
+    def test_group_title_style(self):
+        lay = build_layout(self.params, cfg(group_title_style="number", group_names={"0": "Syn"}))
+        self.assertEqual(lay.group_names[:3], ["G01", "G02", "G03"])
+        self.assertEqual(lay.group_names[15], "G16")  # unused groups too
+        lay = build_layout(self.params, cfg(group_title_style="blank"))
+        self.assertEqual(set(lay.group_names), {""})
+        lay = build_layout(self.params, cfg())
+        self.assertEqual(lay.group_names[:3], ["pol1", "pol2", "Dely"])
+        # titles are stored in the dump and survive a round trip
+        d = synthetic_dump()
+        lay = build_layout(self.params, cfg(group_title_style="number"))
+        sx.apply_layout(d, 15, "RNBO", lay.group_names, lay.encoder_names(), cc_base=16,
+                        resolution="7bit", mode="Acc1", live_names=True)
+        names = sx.read_names(sx.parse_dump(sx.build_dump(d)), 15)
+        self.assertEqual(names["groups"][:2] + names["groups"][-1:], ["G01 ", "G02 ", "G16 "])
+
+    def test_hide_devices(self):
+        lay = build_layout(self.params, cfg(hide_devices=["delay"]))  # alias "Delay", any case
+        self.assertEqual({s.param.inst for s in lay.slots}, {0})
+        self.assertEqual(lay.hidden, ["1 Delay"])
+        lay = build_layout(self.params, cfg(hide_devices=["0"]))  # by instance number
+        self.assertEqual({s.param.inst for s in lay.slots}, {1})
+        self.assertEqual(lay.slots[0].group, 0)  # remaining device moves up to group 1
+        self.assertEqual(lay.group_names[0], "Dely")
+        lay = build_layout(self.params, cfg(hide_devices=["^poly"]))
+        self.assertEqual(lay.hidden, ["0 polysynth"])
+        lay = build_layout(self.params, cfg(hide_devices=["synth$", "1"]))
+        self.assertEqual(lay.slots, [])
+        self.assertIn("No parameters left after hiding devices", format_table(lay))
+        self.assertIn("Hidden devices (hide_devices): 0 polysynth, 1 Delay", format_table(lay))
+
+    def test_hide_devices_with_prefix(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {"0": make_instance(0, "j.reverb", [("size", 0, 0.5)]),
+                             "1": make_instance(1, "j.mix", [("gain", 0, 0.5)])}}
+        lay = build_layout(parse_params(tree), cfg(strip_prefixes=["j."], hide_devices=["^reverb$"]))
+        self.assertEqual([s.param.inst for s in lay.slots], [1])
 
     def test_overflow(self):
         many = parse_params(default_tree()) * 13  # 299 params

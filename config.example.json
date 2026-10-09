@@ -25,6 +25,8 @@
   "group_names": { "0": "Syn", "1": "Echo" },
   "strip_prefixes": ["j."],
   "name_case": "keep",
+  "group_title_style": "instance",
+  "hide_devices": [],
 
   "live_names": true,
   "notify_graph_change": true,

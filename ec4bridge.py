@@ -59,6 +59,8 @@ DEFAULTS = {
     "group_names": {},
     "strip_prefixes": [],
     "name_case": "keep",
+    "group_title_style": "instance",
+    "hide_devices": [],
     "backup_syx": "ec4-backup.syx",
     "layout_syx": "ec4-layout.syx",
     "layout_txt": "layout.txt",
@@ -101,6 +103,19 @@ def load_config(path: str | None) -> dict:
     cfg["name_case"] = str(cfg["name_case"] or "keep").strip().lower()
     if cfg["name_case"] not in NAME_CASES:
         raise SystemExit("name_case must be one of " + ", ".join(NAME_CASES))
+    if not isinstance(cfg["hide_devices"], list):
+        raise SystemExit('hide_devices must be a list, e.g. ["reverb", "2"]')
+    import re as _re
+    for pat in cfg["hide_devices"]:
+        if not str(pat).strip().isdigit():
+            try:
+                _re.compile(str(pat))
+            except _re.error as exc:
+                raise SystemExit(f"hide_devices entry {pat!r} is not a valid pattern: {exc}")
+    from layout import GROUP_TITLE_STYLES
+    cfg["group_title_style"] = str(cfg["group_title_style"] or "instance").strip().lower()
+    if cfg["group_title_style"] not in GROUP_TITLE_STYLES:
+        raise SystemExit("group_title_style must be one of " + ", ".join(GROUP_TITLE_STYLES))
     if cfg["encoder_mode"] not in ec4_sysex.ENCODER_MODES:
         raise SystemExit("encoder_mode must be one of " + ", ".join(ec4_sysex.ENCODER_MODES))
     top = 31 if cfg["resolution"] == "14bit" else 127
