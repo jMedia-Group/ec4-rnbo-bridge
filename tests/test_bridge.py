@@ -1207,6 +1207,50 @@ class DisplayPacingTests(unittest.TestCase):
         ec4.q.close()
 
 
+class OscPacerTests(unittest.TestCase):
+    def test_paces_per_parameter_and_keeps_last_value(self):
+        from oscpacer import OscPacer
+        sent = []
+        p = OscPacer(lambda a, v: sent.append((time.monotonic(), a, v)), 0.02)
+        t0 = time.monotonic()
+        for i in range(100):  # 100 steps in ~0.2 s on one knob, plus one other knob
+            p.submit("k", "/a", i / 100)
+            if i == 50:
+                p.submit("j", "/b", 0.5)
+            time.sleep(0.002)
+        self.assertTrue(p.flush(1))
+        a = [x for x in sent if x[1] == "/a"]
+        self.assertEqual(a[0][2], 0.0)  # first change goes out at once
+        self.assertLess(a[0][0] - t0, 0.01)
+        self.assertEqual(a[-1][2], 0.99)  # the final value is never lost
+        self.assertLess(len(a), 25)  # far fewer than 100
+        gaps = [b[0] - a_[0] for a_, b in zip(a, a[1:])]
+        self.assertGreaterEqual(min(gaps), 0.015)
+        self.assertEqual([x[2] for x in sent if x[1] == "/b"], [0.5])  # other knob not delayed by /a
+        p.close()
+
+    def test_interval_zero_sends_everything(self):
+        from oscpacer import OscPacer
+        sent = []
+        p = OscPacer(lambda a, v: sent.append(v), 0)
+        for i in range(10):
+            p.submit("k", "/a", i)
+        self.assertEqual(sent, list(range(10)))
+        p.close()
+
+    def test_bridge_measures_runner_reply_time(self):
+        osc = []
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none"), midi=FakeMidi(),
+                   osc_send=lambda a, v: osc.append((a, v)))
+        b.update_from_params(parse_params(default_tree()))
+        b.on_cc(2, 18, 64)
+        time.sleep(0.03)
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", osc[-1][1])  # runner reports it back
+        st = b.take_osc_stats()
+        self.assertEqual((st["sent"], st["replies"]), (1, 1))
+        self.assertGreaterEqual(st["lat_max"], 0.025)
+
+
 class CliTests(unittest.TestCase):
     def test_list_and_make_syx(self):
         runner = MockRunner()

@@ -34,6 +34,7 @@ import urllib.error
 import ec4_remote
 import ec4_sysex
 from layout import Layout, Slot, build_layout, format_table
+from oscpacer import OscPacer
 from rnbo import Param, fetch_tree, graph_signature, instance_names, parse_params
 
 log = logging.getLogger("ec4bridge")
@@ -77,6 +78,7 @@ DEFAULTS = {
     "value_popup_rest_ms": 120,
     "value_popup_interval_ms": 250,
     "display_quiet_ms": 400,
+    "osc_send_interval_ms": 15,
     "units": {},
     "notify_graph_change": True,
     "notify_seconds": 2.5,
@@ -205,6 +207,11 @@ class Bridge:
         self._polled: dict[str, float] = {}  # normalized values seen in the last poll
         self._sent_cc: dict[tuple[int, int], tuple[int, float]] = {}  # what we last sent the EC4
         self.feedback_counts: dict[str, int] = {}  # values sent back to the EC4, per parameter
+        # changes to the runner: paced per parameter, and timed until the runner reports them back
+        self._pacer = OscPacer(self._osc_out, float(cfg.get("osc_send_interval_ms", 15)) / 1000.0) \
+            if osc_send else None
+        self._sent_at: dict[str, tuple[float, float]] = {}
+        self.osc_stats = {"sent": 0, "replies": 0, "lat_sum": 0.0, "lat_max": 0.0}
         self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
         self._popup_pending: tuple[Slot, object] | None = None
         self._popup_last = 0.0
@@ -656,13 +663,22 @@ class Bridge:
         hold = getattr(self.midi, "hold_display", None) if self.midi is not None else None
         if hold:  # nothing is drawn on the EC4 until the knob has rested this long
             hold(float(self.cfg.get("display_quiet_ms", 400)) / 1000.0)
-        if self.osc_send:
-            self.osc_send(addr, float(norm))
+        if self._pacer:
+            self._pacer.submit(k, addr, float(norm))
         # show the name and value right away (a linear estimate); the runner's exact value
         # replaces it as soon as it comes back over OSC
         self.value_popup(slot, slot.param.approx_value(norm))
 
     # ---- runner -> EC4 -----------------------------------------------------
+    def _osc_out(self, address: str, value: float):
+        self._sent_at[address] = (time.monotonic(), value)
+        self.osc_stats["sent"] += 1
+        self.osc_send(address, value)
+
+    def take_osc_stats(self) -> dict:
+        s, self.osc_stats = self.osc_stats, {"sent": 0, "replies": 0, "lat_sum": 0.0, "lat_max": 0.0}
+        return s
+
     def on_osc(self, address: str, *args):
         if not args:
             return
@@ -679,6 +695,14 @@ class Bridge:
             v = float(args[0])
         except (TypeError, ValueError):
             return
+        sent = self._sent_at.get(address)
+        if sent and abs(sent[1] - v) < 1e-3:  # the runner reporting back a change we sent
+            lat = time.monotonic() - sent[0]
+            st = self.osc_stats
+            st["replies"] += 1
+            st["lat_sum"] += lat
+            st["lat_max"] = max(st["lat_max"], lat)
+            self._sent_at.pop(address, None)
         with self.lock:
             slot = self.by_addr.get(address)
             if slot is None:
@@ -849,6 +873,11 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
                 last_stats = time.monotonic()
                 st = midi.take_stats()
                 fb, bridge.feedback_counts = bridge.feedback_counts, {}
+                os_ = bridge.take_osc_stats()
+                if os_["sent"]:
+                    avg = os_["lat_sum"] / os_["replies"] * 1000 if os_["replies"] else 0
+                    log.info("last %ds: to runner %d changes; it reported %d back, avg %.0f ms, slowest %.0f ms",
+                             span, os_["sent"], os_["replies"], avg, os_["lat_max"] * 1000)
                 if st["cc"] or st["sysex"] or st["display"] or st["received_cc"]:
                     busiest = ", ".join(f"{k} {n}" for k, n in sorted(fb.items(), key=lambda x: -x[1])[:3])
                     log.info("last %ds: from EC4 %d knob msgs; to EC4 %d values, %d display, %d other%s%s",
