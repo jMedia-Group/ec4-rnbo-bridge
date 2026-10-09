@@ -5,7 +5,6 @@
   "oscquery_port": 5678,
   "osc_port": 1234,
   "listen_port": 9123,
-  "listen_ip": "auto",
 
   "midi_port": "EC4",
   "ec4_setup": 16,
@@ -37,11 +36,12 @@
   "device_list_seconds": 8,
   "device_list_mode": "momentary",
   "device_list_page_seconds": 2,
-  "live_names_refresh": 0,
   "zero_unused": true,
   "value_popup": true,
   "value_popup_seconds": 1.5,
+  "popup_bar": "hash",
   "units": { "0/cutoff": "Hz" },
+  "trace_seconds": 20,
 
   "backup_syx": "ec4-backup.syx",
   "layout_syx": "ec4-layout.syx",

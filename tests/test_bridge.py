@@ -162,6 +162,30 @@ class SysexTests(unittest.TestCase):
             sx.apply_layout(d, 0, "R", [], names, cc_base=20, resolution="14bit", mode="Acc3")
 
 
+class GraphSignatureTests(unittest.TestCase):
+    def test_signature_changes_only_with_the_graph(self):
+        from rnbo import graph_signature, instance_names
+        runner = MockRunner()
+        try:
+            known = instance_names(runner.tree)
+            self.assertEqual(known, {0: "polysynth", 1: "pingpong"})
+            sig = graph_signature("127.0.0.1", runner.port, known)
+            self.assertEqual(sig[0], "my set")
+            # a parameter value changing doesn't change the signature
+            runner.tree["CONTENTS"]["1"]["CONTENTS"]["params"]["CONTENTS"]["mix"]["VALUE"] = [0.9]
+            self.assertEqual(graph_signature("127.0.0.1", runner.port, known), sig)
+            # a new device does
+            from mock_runner import make_instance
+            runner.tree["CONTENTS"]["2"] = make_instance(2, "reverb", [("size", 0, 0.5)])
+            self.assertNotEqual(graph_signature("127.0.0.1", runner.port, known), sig)
+            del runner.tree["CONTENTS"]["2"]
+            # a different set does
+            runner.tree["CONTENTS"]["control"]["CONTENTS"]["sets"]["CONTENTS"]["current"]["CONTENTS"]["name"]["VALUE"] = ["other"]
+            self.assertNotEqual(graph_signature("127.0.0.1", runner.port, known), sig)
+        finally:
+            runner.close()
+
+
 class LayoutTests(unittest.TestCase):
     def setUp(self):
         self.params = parse_params(default_tree())
@@ -500,6 +524,11 @@ class RunLoopTest(unittest.TestCase):
                         break
                     time.sleep(0.02)
                 self.assertEqual(fake.sent, [(2, 16, 0)])
+                # the whole graph was read once; after that only cheap checks
+                time.sleep(0.5)
+                self.assertEqual(runner.requests.count("/rnbo/inst"), 1)
+                self.assertIn("/rnbo/inst/control/sets/current/name", runner.requests)
+                self.assertIn("/rnbo/inst/1/name", runner.requests)
                 # load a different patcher -> layout rebuilt and written
                 runner.tree["CONTENTS"].pop("1")
                 for _ in range(50):
@@ -521,6 +550,7 @@ class RunLoopTest(unittest.TestCase):
                 osc_in.server_close()
                 runner.close()
         self.assertFalse(t.is_alive())
+        self.assertEqual(runner.requests.count("/rnbo/inst"), 2)  # start-up + after the change
         self.assertIn(("/rnbo/listeners/del", (f"127.0.0.1:{listen_port}",)), got)
 
 
@@ -807,33 +837,38 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
         b.on_cc(0, 17, 127)  # group 1 encoder 2 = cutoff, turned to max
-        ov = self.overlays()
+        ov = self.overlays()  # drawn right away
         self.assertEqual(len(ov), 1)
         rows = [ov[0][i:i + 20].rstrip() for i in range(0, 80, 20)]
-        self.assertEqual(rows, ["Cutoff", "20000", "############### 100%", "polysynth"])
+        self.assertEqual(rows, ["Cutoff", "20000", "####################", "polysynth"])
         self.assertIn(rm.overlay_show(True), self.midi.sysex)
         # the runner reports the exact value back -> pop-up shows it
-        time.sleep(0.1)
         b.on_osc("/rnbo/inst/0/params/cutoff", 1234.4)
         rows = [self.overlays()[-1][i:i + 20].rstrip() for i in range(0, 80, 20)]
-        self.assertEqual(rows, ["Cutoff", "1234", "############### 100%", "polysynth"])
+        self.assertEqual(rows, ["Cutoff", "1234", "####################", "polysynth"])
         # the follow-up only rewrote rows 2-3 (40 characters starting at position 20)
         last = self.overlay_writes()[-1]
         self.assertEqual(last[10:13], bytes([0x4A, 0x21, 0x14]))
         self.assertEqual(len(last), 13 + 40 * 3 + 1)
 
-    def test_value_popup_enum_and_throttle(self):
+    def test_value_popup_enum_updates_while_turning(self):
         b = self.make()
         b.on_sysex(report(15, 0))
         self.midi.sysex.clear()
         b.on_cc(0, 21, 127)  # wave (enum) -> "square"
-        b.on_cc(0, 21, 0)    # immediately again: throttled, shown a moment later
-        self.assertEqual(len(self.overlays()), 1)
-        self.assertEqual(self.overlays()[0][20:40].rstrip(), "square")
-        time.sleep(0.15)
-        self.assertEqual(len(self.overlays()), 2)
-        self.assertEqual(self.overlays()[1][20:40].rstrip(), "sine")
-        self.assertEqual(self.overlays()[1][:20].rstrip(), "wave")  # name still on screen
+        self.assertEqual(self.overlays()[-1][20:40].rstrip(), "square")
+        b.on_cc(0, 21, 0)
+        self.assertEqual(self.overlays()[-1][20:40].rstrip(), "sine")
+        self.assertEqual(self.overlays()[-1][:20].rstrip(), "wave")  # name still on screen
+
+    def test_value_popup_follows_a_turn(self):
+        b = self.make()
+        b.on_sysex(report(15, 0))
+        self.midi.sysex.clear()
+        for v in range(40, 80):
+            b.on_cc(0, 17, v)
+        n = round(79 / 127 * 20)
+        self.assertEqual(self.overlays()[-1][40:60], "#" * n + "." * (20 - n))
 
     def test_value_popup_not_for_runner_changes_or_when_off(self):
         b = self.make()
@@ -875,6 +910,30 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertEqual(lines(1)[1], "10 ms")
         self.assertEqual(lines(2)[1], "0.500 dB")  # from config
         self.assertEqual(lines(3)[1], "saw")  # enums never get a unit
+
+    def test_level_bar_styles(self):
+        from ec4bridge import BAR_STYLES, level_bar
+        for style in BAR_STYLES:
+            for v in (0.0, 0.03, 0.45, 0.5, 0.97, 1.0):
+                bar = level_bar(v, style)
+                self.assertEqual(len(bar), 20, (style, v))
+                self.assertTrue(all(32 <= ord(c) < 127 for c in bar))
+        self.assertEqual(level_bar(0.45), "#########...........")
+        self.assertEqual(level_bar(0.45, "brackets"), "[########..........]")
+        self.assertEqual(level_bar(0.45, "line"), "========>           ")
+        self.assertEqual(level_bar(0.0, "line"), " " * 20)
+        self.assertEqual(level_bar(0.45, "marker"), "---------|----------")
+        self.assertEqual(level_bar(1.0, "marker"), "-------------------|")
+        self.assertEqual(level_bar(0.475, "fine"), "=========-          ")
+        self.assertEqual(level_bar(0.5, "center"), "----------|---------")
+        self.assertEqual(level_bar(0.75, "center"), "----------#####-----")
+        self.assertEqual(level_bar(0.25, "center"), "-----#####----------")
+
+    def test_popup_bar_setting(self):
+        b = self.make(popup_bar="marker")
+        b.on_sysex(report(15, 0))
+        b.on_cc(0, 17, 127)
+        self.assertEqual(self.overlays()[-1][40:60], "-------------------|")
 
     def test_format_value(self):
         f = Bridge.format_value
@@ -981,6 +1040,202 @@ class OutQueueTests(unittest.TestCase):
         q.close()
 
 
+class SlowEC4:
+    """Writes go to an OutQueue; the 'EC4' replies to each display message after `delay`."""
+
+    def __init__(self, delay=0.08, reply=True):
+        from outqueue import OutQueue
+        self.delay, self.reply = delay, reply
+        self.sent, self.sysex = [], []
+        self.connected = True
+        self.q = OutQueue(lambda ch, cc, v: self.sent.append((ch, cc, v)), self._write, ack_timeout=0.3)
+
+    def _write(self, data):
+        self.sysex.append((time.monotonic(), bytes(data)))
+        if self.reply and data[7:9] == bytes([0x4E, 0x22]):
+            threading.Timer(self.delay, self.q.ack).start()
+
+    def send_ccs(self, msgs, pause=0):
+        for m in msgs:
+            self.q.cc(*m)
+
+    def send_sysex(self, data):
+        self.q.sysex(data)
+
+    def display_text(self, d, o, t):
+        self.q.set_text(d, o, t)
+
+    def overlay_visible(self, v):
+        self.q.set_visible(v)
+
+    def invalidate_display(self, d=None, visibility=False):
+        self.q.invalidate(d, visibility)
+
+
+class DisplayPacingTests(unittest.TestCase):
+    def test_one_message_in_flight_and_latest_state_wins(self):
+        ec4 = SlowEC4(delay=0.1)
+        for i in range(30):  # the bridge updates the pop-up 30 times in quick succession
+            ec4.display_text(rm.DISPLAY_OVERLAY, 20, f"value {i:<14}")
+        self.assertTrue(ec4.q.flush(3))
+        msgs = [m for _, m in ec4.sysex]
+        self.assertLessEqual(len(msgs), 3)  # not 30: intermediate states were skipped
+        screen = [" "] * 80
+        for m in msgs:  # replay the writes onto a screen
+            i = 10
+            while m[i] == 0x4A:
+                pos = (m[i + 1] - 0x20) * 16 + (m[i + 2] - 0x10)
+                i += 3
+                while m[i] == 0x4D:
+                    screen[pos] = chr(((m[i + 1] & 0xF) << 4) | (m[i + 2] & 0xF))
+                    pos += 1
+                    i += 3
+        self.assertEqual("".join(screen[20:40]), "value 29".ljust(20))
+        ec4.q.close()
+
+    def test_only_changed_characters_are_sent(self):
+        ec4 = SlowEC4(delay=0.0)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, rm.overlay_rows(["Cutoff", "1000 Hz", "#####", "synth"]))
+        ec4.q.flush(2)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, rm.overlay_rows(["Cutoff", "1010 Hz", "#####", "synth"]))
+        ec4.q.flush(2)
+        last = ec4.sysex[-1][1]
+        self.assertEqual(last, rm.write_runs(3, [(22, "1")]))  # one character
+        ec4.q.invalidate(rm.DISPLAY_OVERLAY)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, rm.overlay_rows(["Cutoff", "1010 Hz", "#####", "synth"]))
+        ec4.q.flush(2)
+        self.assertEqual(len(ec4.sysex[-1][1]), 13 + 80 * 3 + 1)  # full rewrite after invalidate
+        ec4.q.close()
+
+    def test_visibility_sent_only_on_change(self):
+        ec4 = SlowEC4(delay=0.0)
+        for _ in range(5):
+            ec4.overlay_visible(True)
+        ec4.q.flush(2)
+        ec4.overlay_visible(True)
+        ec4.q.flush(2)
+        ec4.overlay_visible(False)
+        ec4.q.flush(2)
+        self.assertEqual([m for _, m in ec4.sysex], [rm.overlay_show(True), rm.overlay_show(False)])
+        ec4.q.close()
+
+    def test_paced_by_timeout_without_reply(self):
+        ec4 = SlowEC4(reply=False)
+        ec4.q.ack_timeout = 0.1
+        ec4.display_text(rm.DISPLAY_NAMES, 0, "a" * 64)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, "b" * 80)
+        ec4.overlay_visible(True)
+        self.assertTrue(ec4.q.flush(2))
+        times = [t for t, _ in ec4.sysex]
+        self.assertEqual(len(times), 3)
+        self.assertGreaterEqual(times[1] - times[0], 0.09)
+        self.assertGreaterEqual(times[2] - times[1], 0.09)
+        ec4.q.close()
+
+    def test_modulated_parameters_keep_updating_while_turning(self):
+        ec4 = SlowEC4(delay=0.0)
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none", value_popup=False),
+                   midi=ec4, osc_send=lambda a, v: None)
+        b.update_from_params(parse_params(default_tree()))
+        ec4.q.flush(3)
+        ec4.sent.clear()
+        for i in range(20):  # turn cutoff while 'mix' is modulated inside the patch
+            b.on_cc(0, 17, 40 + i)
+            b.on_osc("/rnbo/inst/1/params/mix/normalized", i / 40)
+            time.sleep(0.01)
+        ec4.q.flush(2)
+        self.assertTrue(ec4.sent)
+        self.assertEqual(ec4.sent[-1], (2, 18, round(19 / 40 * 127)))  # the latest value arrives
+        self.assertNotIn(0, [ch for ch, cc, v in ec4.sent if cc == 17])  # never fed back to the knob
+        self.assertEqual(b.feedback_counts.get("1/mix"), 20)
+        ec4.q.close()
+
+    def test_ccs_are_not_held_up_by_display(self):
+        ec4 = SlowEC4(delay=0.5)
+        ec4.display_text(rm.DISPLAY_OVERLAY, 0, "x" * 80)
+        time.sleep(0.05)  # display message in flight, waiting for the EC4
+        ec4.send_ccs([(0, 16, 5)])
+        time.sleep(0.05)
+        self.assertEqual(ec4.sent, [(0, 16, 5)])
+        ec4.q.close()
+
+    def test_fast_turning_with_popup_stays_within_ec4_pace(self):
+        ec4 = SlowEC4(delay=0.08)
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none"), midi=ec4,
+                   osc_send=lambda a, v: None)
+        b.update_from_params(parse_params(default_tree()))
+        ec4.q.flush(3)
+        b.on_sysex(report(15, 0))
+        ec4.q.flush(3)
+        start = len(ec4.sysex)
+        t0 = time.monotonic()
+        v = 0
+        while time.monotonic() - t0 < 1.0:  # turn cutoff fast for one second
+            v = (v + 1) % 128
+            b.on_cc(0, 17, v)
+            time.sleep(0.005)
+        ec4.q.flush(3)
+        display_msgs = len(ec4.sysex) - start
+        self.assertLessEqual(display_msgs, 16)  # ~12/s at most, never a backlog
+        b._hide_overlay()
+        ec4.q.close()
+
+
+class OscStatsTests(unittest.TestCase):
+    def test_bridge_measures_runner_reply_time(self):
+        osc = []
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none"), midi=FakeMidi(),
+                   osc_send=lambda a, v: osc.append((a, v)))
+        b.update_from_params(parse_params(default_tree()))
+        b.on_cc(2, 18, 64)
+        time.sleep(0.03)
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", osc[-1][1])  # runner reports it back
+        st = b.take_osc_stats()
+        self.assertEqual((st["sent"], st["replies"]), (1, 1))
+        self.assertGreaterEqual(st["lat_max"], 0.025)
+
+
+class ConfigTests(unittest.TestCase):
+    def own_ip(self):
+        import socket
+        for probe in ("192.0.2.1", "10.255.255.255"):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect((probe, 9))
+                ip = s.getsockname()[0]
+                if not ip.startswith("127.") and ip != "0.0.0.0":
+                    return ip
+            except OSError:
+                pass
+            finally:
+                s.close()
+        self.skipTest("no non-loopback address here")
+
+    def test_is_own_address(self):
+        from ec4bridge import is_own_address
+        self.assertFalse(is_own_address("127.0.0.1"))
+        self.assertFalse(is_own_address("192.0.2.1"))  # documentation range: never this machine
+        self.assertFalse(is_own_address("no-such-host.invalid"))
+        self.assertTrue(is_own_address(self.own_ip()))
+
+    def test_own_address_becomes_loopback_and_retired_keys_are_quiet(self):
+        from ec4bridge import load_config
+        ip = self.own_ip()
+        with tempfile.TemporaryDirectory() as d:
+            conf = os.path.join(d, "config.json")
+            with open(conf, "w") as f:
+                json.dump({"runner_host": ip, "display_quiet_ms": 400, "osc_send_interval_ms": 15,
+                           "listen_ip": "auto", "bogus": 1}, f)
+            with self.assertLogs("ec4bridge", level="INFO") as logs:
+                c = load_config(conf)
+        self.assertEqual(c["runner_host"], "127.0.0.1")
+        text = "\n".join(logs.output)
+        self.assertIn("using 127.0.0.1 instead", text)
+        self.assertIn("no longer used (you can delete them): display_quiet_ms, listen_ip, osc_send_interval_ms", text)
+        self.assertIn("unknown config keys ignored: bogus", text)
+        self.assertNotIn("display_quiet_ms", c)
+
+
 class CliTests(unittest.TestCase):
     def test_list_and_make_syx(self):
         runner = MockRunner()
@@ -1020,6 +1275,109 @@ class CliTests(unittest.TestCase):
                                capture_output=True, text=True, timeout=20)
             self.assertEqual(r.returncode, 1)
             self.assertIn("Could not reach", r.stdout)
+
+
+class TraceTests(unittest.TestCase):
+    MIX = "/rnbo/inst/1/params/mix/normalized"
+
+    def synthetic(self, gap=0.01, jump=1, reply=0.002, foreign=False):
+        """One knob turned 20 steps; optionally a stall, slow replies or a value from elsewhere."""
+        ev, t, v = [], 100.0, 40
+        for i in range(20):
+            step = jump if i == 10 else 1
+            t += gap if i == 10 else 0.01
+            v += step
+            n = v / 127
+            ev.append((t, "set", "1/mix", self.MIX, n))
+            ev.append((t + 0.0005, "osc_out", self.MIX, n))
+            ev.append((t + 0.0005 + reply, "osc_in", self.MIX, n))
+        if foreign:
+            ev.append((t + 0.005, "osc_in", self.MIX, 0.9))
+        ev.sort()
+        return ev
+
+    def test_smooth_turn(self):
+        from ec4trace import analyze
+        text = "\n".join(analyze(self.synthetic()))
+        self.assertIn("EC4 -> bridge: smooth", text)
+        self.assertIn("slowest 2 ms", text)
+        self.assertNotIn("never sent", text)
+
+    def test_stall_found(self):
+        from ec4trace import analyze
+        ev = self.synthetic(gap=0.3, jump=12)
+        ev.append((ev[0][0] + 0.12, "to_ec4_sysex", b"\xf0\xf7"))
+        ev.sort()
+        text = "\n".join(analyze(ev, {self.MIX: ("1/mix (mix)", 0)}))
+        self.assertIn("1 stall(s)", text)
+        self.assertIn("silent for 300 ms, jumped 12 steps", text)
+        self.assertIn("to_ec4_sysex x1", text)
+
+    def test_slow_runner_and_foreign_values(self):
+        from ec4trace import analyze
+        text = "\n".join(analyze(self.synthetic(reply=0.4, foreign=True), {self.MIX: ("1/mix (mix)", 0)}))
+        self.assertIn("slowest 400 ms", text)
+        self.assertIn("1/mix (mix) took 400 ms", text)
+        self.assertIn("1 value(s) reported by the runner that the bridge never sent", text)
+
+    def test_stepped_parameter_rounding_is_not_foreign(self):
+        from ec4trace import analyze
+        ev = [(1.0, "set", "1/m", self.MIX, 0.30), (1.001, "osc_out", self.MIX, 0.30),
+              (1.002, "osc_in", self.MIX, 1 / 3)]
+        text = "\n".join(analyze(ev, {self.MIX: ("m", 4)}))
+        self.assertNotIn("never sent", text)
+        self.assertIn("0 of 1 never reported back", text)
+
+    def test_trace_on_bridge_writes_file(self):
+        import ec4bridge
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(layout_txt=os.path.join(d, "l.txt"), backup_syx=os.path.join(d, "none.syx"),
+                    value_popup=False)
+            osc = []
+            b = Bridge(c, midi=FakeMidi(), osc_send=lambda a, v: osc.append((a, v)))
+            b.update_from_params(parse_params(default_tree()))
+            old = ec4bridge.TRACE_DIR
+            ec4bridge.TRACE_DIR = d
+            try:
+                b.trace.start(5)
+                for v in range(60, 70):
+                    b.on_cc(2, 18, v)  # group 3 encoder 3: delay mix
+                    time.sleep(0.02)
+                    b.on_osc(self.MIX, v / 127)
+                b.on_cc(9, 99, 1)  # unmapped: recorded, not a parameter change
+                path = ec4bridge.finish_trace(b)
+            finally:
+                ec4bridge.TRACE_DIR = old
+            self.assertFalse(b.trace.active)
+            with open(path) as f:
+                text = f.read()
+            self.assertIn("11 knob messages from the EC4, 10 parameter changes, 10 sent to the runner", text)
+            self.assertIn("EC4 -> bridge: smooth", text)
+            self.assertIn("TIMELINE", text)
+            self.assertIn("osc_out", text)
+            self.assertIn("1/mix", text)
+
+
+    def test_stall_context_whole_runner_vs_one_parameter(self):
+        from ec4trace import analyze
+        A, B = self.MIX, "/rnbo/inst/0/params/cutoff/normalized"
+        frozen = [(1.0, "set", "1/mix", A, 0.3), (1.0, "osc_out", A, 0.3), (6.0, "osc_in", A, 0.3),
+                  (2.0, "osc_out", B, 0.5), (6.0, "osc_in", B, 0.5)]
+        text = "\n".join(analyze(sorted(frozen)))
+        self.assertIn("took 5000 ms", text)
+        self.assertIn("1 change(s) to other parameters were sent; 0 answered within 100 ms", text)
+        self.assertIn("the runner sent nothing at all", text)
+        alive = [(1.0, "set", "1/mix", A, 0.3), (1.0, "osc_out", A, 0.3), (6.0, "osc_in", A, 0.3),
+                 (2.0, "osc_out", B, 0.5), (2.002, "osc_in", B, 0.5), (2.002, "osc_rx", B)]
+        text = "\n".join(analyze(sorted(alive)))
+        self.assertIn("1 answered within 100 ms", text)
+        self.assertIn("/rnbo/inst/0 x1 (so only this was stuck", text)
+        self.assertIn("turned: 1/mix x1", text)
+
+    def test_no_recording_when_idle(self):
+        b = Bridge(cfg(), midi=FakeMidi())
+        b.on_cc(0, 16, 1)
+        self.assertEqual(b.trace.events, [])
 
 
 if __name__ == "__main__":

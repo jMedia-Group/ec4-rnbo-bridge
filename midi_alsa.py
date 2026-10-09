@@ -12,7 +12,10 @@ import threading
 import time
 from typing import Callable
 
+from ec4_remote import HEADER
 from outqueue import OutQueue
+
+ACK = HEADER + b"\xf7"  # F0 00 00 00 4E 2C 1B F7: the EC4's reply to a display message
 
 from alsa_midi import (
     ControlChangeEvent,
@@ -65,6 +68,7 @@ class EC4Midi:
             self.log(f"could not enlarge MIDI input buffer: {exc}")
         self._overruns = 0
         self._overrun_logged = 0.0
+        self._received_cc = 0
 
     # ---- device discovery -------------------------------------------------
     def find_device(self):
@@ -107,6 +111,7 @@ class EC4Midi:
         except Exception:
             pass
         self._device = addr
+        self._queue.invalidate()  # whatever is on its screens now is unknown
         self.log(f"EC4 connected: {dev.client_name}:{dev.name} ({addr[0]}:{addr[1]})")
         return True
 
@@ -127,6 +132,27 @@ class EC4Midi:
 
     def flush(self, timeout: float = 5.0) -> bool:
         return self._queue.flush(timeout)
+
+    # display text: only changes are sent, paced by the EC4's replies (see outqueue.py)
+    def display_text(self, display: int, offset: int, text: str):
+        if self._device:
+            self._queue.set_text(display, offset, text)
+
+    def overlay_visible(self, visible: bool):
+        if self._device:
+            self._queue.set_visible(visible)
+
+    def take_stats(self) -> dict:
+        """Messages written to / received from the EC4 since the last call."""
+        s = dict(self._queue.stats)
+        for k in self._queue.stats:
+            self._queue.stats[k] = 0
+        s["received_cc"], self._received_cc = self._received_cc, 0
+        s["overruns"] = self._overruns
+        return s
+
+    def invalidate_display(self, display: int | None = None, visibility: bool = False):
+        self._queue.invalidate(display, visibility)
 
     def _write_cc(self, channel: int, cc: int, value: int):
         if not self._device:
@@ -182,6 +208,7 @@ class EC4Midi:
             if ev is None:
                 continue
             if isinstance(ev, ControlChangeEvent) and self.on_cc:
+                self._received_cc += 1
                 self.on_cc(ev.channel, ev.param, ev.value)
             elif isinstance(ev, SysExEvent):
                 data = bytes(ev.data)
@@ -191,6 +218,8 @@ class EC4Midi:
                 if data[-1:] == b"\xf7":
                     msg = bytes(self._sysex_buf)
                     self._sysex_buf = bytearray()
+                    if msg == ACK:
+                        self._queue.ack()  # the EC4's reply to each display message
                     if self.on_sysex:
                         self.on_sysex(msg)
 

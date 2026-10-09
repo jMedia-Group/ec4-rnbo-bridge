@@ -57,15 +57,54 @@ def write_text(display: int, offset: int, text: str) -> bytes:
     return bytes(out)
 
 
+def names_text(names: list[str | None]) -> str:
+    """The names page as 64 characters (16 names x 4; None = blank)."""
+    cells = [((n or "") + "    ")[:4] for n in (list(names) + [None] * 16)[:16]]
+    return "".join(cells)
+
+
 def names_page(names: list[str | None]) -> bytes:
     """Write 16 encoder names (4 chars each; None = blank) to the names page."""
-    cells = [((n or "") + "    ")[:4] for n in (list(names) + [None] * 16)[:16]]
-    return write_text(DISPLAY_NAMES, 0, "".join(cells))
+    return write_text(DISPLAY_NAMES, 0, names_text(names))
+
+
+def overlay_rows(lines: list[str]) -> str:
+    """The overlay as 80 characters (4 rows x 20)."""
+    return "".join(((l or "") + " " * 20)[:20] for l in (list(lines) + [""] * 4)[:4])
 
 
 def overlay_text(lines: list[str]) -> bytes:
-    rows = [((l or "") + " " * 20)[:20] for l in (list(lines) + [""] * 4)[:4]]
-    return write_text(DISPLAY_OVERLAY, 0, "".join(rows))
+    return write_text(DISPLAY_OVERLAY, 0, overlay_rows(lines))
+
+
+def diff_runs(old: str | None, new: str, merge_gap: int = 2) -> list[tuple[int, str]]:
+    """Changed stretches of a screen as (offset, text). old=None means unknown: rewrite all.
+    Stretches separated by at most merge_gap unchanged characters are joined (a new position
+    command costs as much as a character)."""
+    if old is None or len(old) != len(new):
+        return [(0, new)] if new else []
+    runs: list[list] = []
+    for i, (a, b) in enumerate(zip(old, new)):
+        if a == b:
+            continue
+        if runs and i - (runs[-1][0] + len(runs[-1][1])) <= merge_gap:
+            start = runs[-1][0]
+            runs[-1][1] = new[start:i + 1]
+        else:
+            runs.append([i, b])
+    return [(o, t) for o, t in runs]
+
+
+def write_runs(display: int, runs: list[tuple[int, str]]) -> bytes:
+    """One message writing several stretches of a display (like DrivenByMoss' diff writes)."""
+    out = bytearray(HEADER)
+    out += bytes([CMD_APP, APP_DISPLAY, 0x10 + display])
+    for offset, text in runs:
+        out += bytes([0x4A, 0x20 + offset // 16, 0x10 + offset % 16])
+        for b in _ascii(text):
+            out += bytes([0x4D, *_nib(b)])
+    out.append(0xF7)
+    return bytes(out)
 
 
 def overlay_show(visible: bool) -> bytes:

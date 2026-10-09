@@ -71,7 +71,10 @@ def default_tree():
     ] + [(f"extra{i}", 6 + i, 0.25) for i in range(14)]  # 20 params -> spills into group 2
     delay = [("time", 0, 250.0, 0.0, 2000.0), ("feedback", 1, 0.4), ("mix", 2, 0.3)]
     return {"FULL_PATH": "/rnbo/inst", "CONTENTS": {
-        "control": {"FULL_PATH": "/rnbo/inst/control", "CONTENTS": {}},
+        "control": {"FULL_PATH": "/rnbo/inst/control", "CONTENTS": {
+            "sets": {"FULL_PATH": "/rnbo/inst/control/sets", "CONTENTS": {
+                "current": {"FULL_PATH": "/rnbo/inst/control/sets/current", "CONTENTS": {
+                    "name": _leaf("/rnbo/inst/control/sets/current/name", "my set", "s", access=1)}}}}}},
         "config": {"FULL_PATH": "/rnbo/inst/config", "CONTENTS": {}},
         "0": make_instance(0, "polysynth", synth),
         "1": make_instance(1, "pingpong", delay, alias="Delay"),
@@ -81,15 +84,24 @@ def default_tree():
 class MockRunner:
     def __init__(self, tree=None):
         self.tree = tree or default_tree()
+        self.requests: list[str] = []
         runner = self
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path.rstrip("/") != "/rnbo/inst":
+                path = self.path.split("?")[0].rstrip("/")
+                runner.requests.append(path)
+                node = runner.tree if path.startswith("/rnbo/inst") else None
+                for part in path[len("/rnbo/inst"):].strip("/").split("/") if node else []:
+                    if part:
+                        node = (node.get("CONTENTS") or {}).get(part)
+                        if node is None:
+                            break
+                if node is None:
                     self.send_response(404)
                     self.end_headers()
                     return
-                body = json.dumps(runner.tree).encode()
+                body = json.dumps(node).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
