@@ -187,7 +187,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `zero_unused` | `true` | set every encoder without a parameter to 0 (on a new graph, at start-up and when you return to the RNBO setup), so no values are left over from the previous graph |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |
 | `strip_prefixes` | `[]` | prefixes removed from instance and parameter names before shortening, e.g. `["j."]` turns `j.reverb` into `revr` |
-| `feedback_holdoff_ms` | 250 | don't echo a value back to an encoder you're turning |
+| `feedback_holdoff_ms` | 1000 | after you turn an encoder, ignore the runner's reports for it this long, so a late report can't snap the knob back |
 | `poll_interval` | 2.0 | seconds between OSCQuery scans (patch changes, missed values) |
 
 **14-bit mode** uses the EC4's 14-bit CC type (CC 16–31 plus LSB on CC 48–63) for smooth
@@ -195,6 +195,11 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
 "large step" mode, so a full sweep doesn't take many turns.
 
 ## Troubleshooting
+
+- **Knobs jump or stutter**: make sure `feedback_holdoff_ms` is at least 1000 (older example
+  configs had 250). If the EC4's own value display flashes over the pop-up, turn it off on the
+  EC4 with SHIFT + NAME, or set `"value_popup": false` to compare. Check the log for "MIDI output
+  error".
 
 - **"Receive error" on the EC4 during `send-layout`**: something else reached the EC4 in the middle
   of the dump. `send-layout` and `capture-backup` pause a running bridge service automatically

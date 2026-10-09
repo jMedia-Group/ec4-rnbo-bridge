@@ -340,6 +340,14 @@ class BridgeTests(unittest.TestCase):
         b.on_cc(0, 1, 64)  # other CC -> ignored
         self.assertEqual(len(self.osc), 1)
 
+    def test_late_report_does_not_snap_knob_back(self):
+        b = self.make()  # default hold-off: 1 s
+        self.midi.sent.clear()
+        b.on_cc(2, 18, 100)  # turn 'mix' up
+        time.sleep(0.4)  # a slow runner reports an older value 400 ms later
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 20 / 127)
+        self.assertEqual(self.midi.sent, [])  # the knob is not pulled back
+
     def test_feedback_and_holdoff(self):
         b = self.make()
         self.midi.sent.clear()
@@ -353,7 +361,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.midi.sent, [])
 
     def test_14bit(self):
-        b = self.make(resolution="14bit")
+        b = self.make(resolution="14bit", feedback_holdoff_ms=250)
         self.midi.sent.clear()
         b.on_cc(0, 16, 64)  # MSB alone does nothing
         self.assertEqual(self.osc, [])
@@ -649,7 +657,20 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertFalse(b.paused())
 
     def overlays(self):
-        return [self.text(m) for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+        """Overlay screen contents after each write (writes may start mid-screen)."""
+        screen = [" "] * 80
+        out = []
+        for m in self.midi.sysex:
+            if m[7:10] != bytes([0x4E, 0x22, 0x13]):
+                continue
+            off = (m[11] - 0x20) * 16 + (m[12] - 0x10)
+            for i, ch in enumerate(self.text(m)):
+                screen[off + i] = ch
+            out.append("".join(screen))
+        return out
+
+    def overlay_writes(self):
+        return [m for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
 
     def test_device_list_popup(self):
         b = self.make(notify_group_change=True, device_list_mode="toggle")
@@ -756,10 +777,14 @@ class LiveDisplayTests(unittest.TestCase):
         self.assertEqual(rows, ["Cutoff", "20000", "############### 100%", "polysynth"])
         self.assertIn(rm.overlay_show(True), self.midi.sysex)
         # the runner reports the exact value back -> pop-up shows it
-        time.sleep(0.06)
+        time.sleep(0.1)
         b.on_osc("/rnbo/inst/0/params/cutoff", 1234.4)
         rows = [self.overlays()[-1][i:i + 20].rstrip() for i in range(0, 80, 20)]
-        self.assertEqual(rows[1], "1234")
+        self.assertEqual(rows, ["Cutoff", "1234", "############### 100%", "polysynth"])
+        # the follow-up only rewrote rows 2-3 (40 characters starting at position 20)
+        last = self.overlay_writes()[-1]
+        self.assertEqual(last[10:13], bytes([0x4A, 0x21, 0x14]))
+        self.assertEqual(len(last), 13 + 40 * 3 + 1)
 
     def test_value_popup_enum_and_throttle(self):
         b = self.make()
@@ -769,9 +794,10 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_cc(0, 21, 0)    # immediately again: throttled, shown a moment later
         self.assertEqual(len(self.overlays()), 1)
         self.assertEqual(self.overlays()[0][20:40].rstrip(), "square")
-        time.sleep(0.1)
+        time.sleep(0.15)
         self.assertEqual(len(self.overlays()), 2)
         self.assertEqual(self.overlays()[1][20:40].rstrip(), "sine")
+        self.assertEqual(self.overlays()[1][:20].rstrip(), "wave")  # name still on screen
 
     def test_value_popup_not_for_runner_changes_or_when_off(self):
         b = self.make()
@@ -862,6 +888,41 @@ class TestDisplayCommandTests(unittest.TestCase):
 def argparse_ns(**kw):
     import argparse
     return argparse.Namespace(**kw)
+
+
+class OutQueueTests(unittest.TestCase):
+    def test_coalesce(self):
+        from outqueue import coalesce
+        t1 = ("sysex", rm.overlay_text(["a"]))
+        t2 = ("sysex", rm.overlay_text(["b"]))
+        part = ("sysex", rm.write_text(rm.DISPLAY_OVERLAY, 20, "x" * 40))
+        show, hide = ("sysex", rm.overlay_show(True)), ("sysex", rm.overlay_show(False))
+        names = ("sysex", rm.names_page(["n"]))
+        req = ("sysex", rm.REQUEST_INFO)
+        items = [("cc", 0, 16, 1), t1, show, ("cc", 0, 16, 5), ("cc", 1, 16, 9), req, t2, part,
+                 hide, show, names, req]
+        out = coalesce(items)
+        self.assertEqual(out, [("cc", 0, 16, 5), ("cc", 1, 16, 9), req, t2, part, show, names, req])
+
+    def test_queue_writes_in_background(self):
+        from outqueue import OutQueue
+        written = []
+        gate = threading.Event()
+
+        def slow_cc(ch, cc, v):
+            gate.wait(1)  # the EC4 is slow to take data
+            written.append((ch, cc, v))
+
+        q = OutQueue(slow_cc, lambda d: written.append(d))
+        t0 = time.monotonic()
+        for v in range(50):
+            q.cc(0, 16, v)  # never blocks the caller
+        self.assertLess(time.monotonic() - t0, 0.1)
+        gate.set()
+        self.assertTrue(q.flush(2))
+        self.assertEqual(written[-1], (0, 16, 49))  # newest value always arrives
+        self.assertLess(len(written), 50)  # stale ones were dropped
+        q.close()
 
 
 class CliTests(unittest.TestCase):

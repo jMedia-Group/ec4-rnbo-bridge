@@ -11,6 +11,8 @@ import threading
 import time
 from typing import Callable
 
+from outqueue import OutQueue
+
 from alsa_midi import (
     ControlChangeEvent,
     PortCaps,
@@ -38,6 +40,8 @@ class EC4Midi:
         # NO_EXPORT: only this client may subscribe, so JACK's ALSA bridge (and with it the
         # RNBO runner) never sees these ports and our feedback CCs can't leak into a patch.
         self._out_lock = threading.Lock()
+        # everything goes out through one background thread so reading encoders never waits
+        self._queue = OutQueue(self._write_cc, self._write_sysex, on_error=log)
         self._device = None  # (client_id, port_id)
         self._sysex_buf = bytearray()
         self._stop = threading.Event()
@@ -89,7 +93,24 @@ class EC4Midi:
         return True
 
     # ---- output -----------------------------------------------------------
+    # send_* only queue; the OutQueue thread writes (and drops superseded messages)
     def send_cc(self, channel: int, cc: int, value: int):
+        if self._device:
+            self._queue.cc(channel, cc, value)
+
+    def send_ccs(self, msgs: list[tuple[int, int, int]], pause: float = 0.0):
+        for ch, cc, v in msgs:
+            self.send_cc(ch, cc, v)
+
+    def send_sysex(self, data: bytes):
+        """Queue one (short) SysEx message."""
+        if self._device:
+            self._queue.sysex(data)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        return self._queue.flush(timeout)
+
+    def _write_cc(self, channel: int, cc: int, value: int):
         if not self._device:
             return
         with self._out_lock:
@@ -97,14 +118,7 @@ class EC4Midi:
                                    port=self._out_port)
             self._out.drain_output()
 
-    def send_ccs(self, msgs: list[tuple[int, int, int]], pause: float = 0.0005):
-        for ch, cc, v in msgs:
-            self.send_cc(ch, cc, v)
-            if pause:
-                time.sleep(pause)
-
-    def send_sysex(self, data: bytes):
-        """Send one (short) SysEx message."""
+    def _write_sysex(self, data: bytes):
         if not self._device:
             return
         with self._out_lock:
@@ -116,6 +130,7 @@ class EC4Midi:
         """Send one long SysEx message as consecutive fragments."""
         if not self._device:
             raise RuntimeError("EC4 not connected")
+        self._queue.flush()  # nothing queued may end up inside the dump
         total = len(chunks)
         with self._out_lock:
             for i, chunk in enumerate(chunks):
@@ -154,6 +169,8 @@ class EC4Midi:
                         self.on_sysex(msg)
 
     def close(self):
+        self._queue.flush(2.0)  # let queued messages (e.g. a final 'hide pop-up') go out
+        self._queue.close()
         self._stop.set()
         for c in (self._out,):  # the input client is left to die with the reader thread
             try:

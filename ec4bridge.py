@@ -51,7 +51,7 @@ DEFAULTS = {
     "display": "",
     "cc_base": 16,
     "poll_interval": 2.0,
-    "feedback_holdoff_ms": 250,
+    "feedback_holdoff_ms": 1000,
     "new_group_per_instance": True,
     "include": [],
     "exclude": [],
@@ -196,6 +196,9 @@ class Bridge:
         self._popup_pending: tuple[Slot, object] | None = None
         self._popup_last = 0.0
         self._popup_timer: threading.Timer | None = None
+        self._overlay_visible = False
+        self._overlay_owner = None
+        self._overlay_lines: list[str] = [""] * 4
         self._was_paused = False
 
     # ---- layout ------------------------------------------------------------
@@ -352,20 +355,31 @@ class Bridge:
             lines.append(f"page {pages.index(g) + 1} of {len(pages)}")
         return lines
 
-    def notify(self, lines: list[str], seconds: float | None = None):
-        """Show a short message on the EC4's 4x20 overlay."""
+    def notify(self, lines: list[str], seconds: float | None = None, owner=None):
+        """Show a short message on the EC4's 4x20 overlay.
+
+        owner identifies what's on the overlay (e.g. the value pop-up of one parameter), so a
+        follow-up update can rewrite only the lines that changed.
+        """
         if not self.on_my_setup() or self.midi is None:
             return
         self._send_sysex(ec4_remote.overlay_text(lines))
         self._send_sysex(ec4_remote.overlay_show(True))
+        self._overlay_visible = True
+        self._overlay_owner = owner
+        self._overlay_lines = [((l or "") + " " * 20)[:20] for l in (list(lines) + [""] * 4)[:4]]
+        self._arm_overlay_timer(float(self.cfg["notify_seconds"] if seconds is None else seconds))
+
+    def _arm_overlay_timer(self, secs: float):
         if self._overlay_timer:
             self._overlay_timer.cancel()
-        secs = float(self.cfg["notify_seconds"] if seconds is None else seconds)
         self._overlay_timer = threading.Timer(secs, self._overlay_timeout)
         self._overlay_timer.daemon = True
         self._overlay_timer.start()
 
     def _overlay_timeout(self):
+        self._overlay_visible = False
+        self._overlay_owner = None
         self._list_page = None
         self._list_held = False
         if self._rotate_timer:
@@ -411,13 +425,13 @@ class Bridge:
         return [p.label[:20], self.format_value(raw)[:20], bar, device[:20]]
 
     def value_popup(self, slot: Slot, raw):
-        """Full parameter name, value, bar and device on the overlay (throttled to ~20/s)."""
+        """Full parameter name, value, bar and device on the overlay (throttled to ~12/s)."""
         if not self.cfg.get("value_popup", True) or self._list_held:
             return
         if not self.on_my_setup() or self.paused() or self.midi is None:
             return
         self._popup_pending = (slot, raw)
-        wait = 0.05 - (time.monotonic() - self._popup_last)
+        wait = 0.08 - (time.monotonic() - self._popup_last)
         if wait <= 0:
             self._flush_popup()
         elif not (self._popup_timer and self._popup_timer.is_alive()):
@@ -431,7 +445,19 @@ class Bridge:
             return
         self._popup_last = time.monotonic()
         slot, raw = pending
-        self.notify(self.value_popup_lines(slot, raw), seconds=float(self.cfg["value_popup_seconds"]))
+        lines = self.value_popup_lines(slot, raw)
+        secs = float(self.cfg["value_popup_seconds"])
+        owner = ("value", slot.param.key)
+        if self._overlay_visible and self._overlay_owner == owner and self.on_my_setup():
+            # same knob still turning: rewrite only the value and bar lines (rows 2-3)
+            rows = [((l or "") + " " * 20)[:20] for l in lines]
+            if rows[1:3] != self._overlay_lines[1:3]:
+                self._send_sysex(ec4_remote.write_text(ec4_remote.DISPLAY_OVERLAY, 20, rows[1] + rows[2]))
+                self._send_sysex(ec4_remote.overlay_show(True))
+                self._overlay_lines[1:3] = rows[1:3]
+            self._arm_overlay_timer(secs)
+        else:
+            self.notify(lines, seconds=secs, owner=owner)
 
     # ---- device list (SHIFT + push encoder 16 by default) ----------------------
     def _is_list_key(self, rep: dict) -> bool:

@@ -16,7 +16,7 @@
   "cc_base": 16,
 
   "poll_interval": 2.0,
-  "feedback_holdoff_ms": 250,
+  "feedback_holdoff_ms": 1000,
 
   "new_group_per_instance": true,
   "include": [],
