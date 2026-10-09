@@ -163,6 +163,21 @@ class SysexTests(unittest.TestCase):
 
 
 class GraphSignatureTests(unittest.TestCase):
+    def test_graph_read_in_pieces_matches_full_tree(self):
+        from rnbo import fetch_graph
+        runner = MockRunner()
+        try:
+            full = parse_params(runner.tree)
+            pieces = parse_params(fetch_graph("127.0.0.1", runner.port, pause=0))
+            self.assertEqual([(p.key, p.label, p.inst_name, p.address, p.normalized, p.enum_values)
+                              for p in pieces],
+                             [(p.key, p.label, p.inst_name, p.address, p.normalized, p.enum_values)
+                              for p in full])
+            self.assertNotIn("/rnbo/inst", runner.requests)
+            self.assertIn("/rnbo/inst/1/params", runner.requests)
+        finally:
+            runner.close()
+
     def test_signature_changes_only_with_the_graph(self):
         from rnbo import graph_signature, instance_names
         runner = MockRunner()
@@ -526,7 +541,8 @@ class RunLoopTest(unittest.TestCase):
                 self.assertEqual(fake.sent, [(2, 16, 0)])
                 # the whole graph was read once; after that only cheap checks
                 time.sleep(0.5)
-                self.assertEqual(runner.requests.count("/rnbo/inst"), 1)
+                self.assertNotIn("/rnbo/inst", runner.requests)  # never the whole tree at once
+                self.assertEqual(runner.requests.count("/rnbo/inst/0/params"), 1)
                 self.assertIn("/rnbo/inst/control/sets/current/name", runner.requests)
                 self.assertIn("/rnbo/inst/1/name", runner.requests)
                 # load a different patcher -> layout rebuilt and written
@@ -550,7 +566,7 @@ class RunLoopTest(unittest.TestCase):
                 osc_in.server_close()
                 runner.close()
         self.assertFalse(t.is_alive())
-        self.assertEqual(runner.requests.count("/rnbo/inst"), 2)  # start-up + after the change
+        self.assertEqual(runner.requests.count("/rnbo/inst/0/params"), 2)  # start-up + after the change
         self.assertIn(("/rnbo/listeners/del", (f"127.0.0.1:{listen_port}",)), got)
 
 

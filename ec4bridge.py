@@ -35,7 +35,7 @@ import ec4_remote
 import ec4_sysex
 from layout import Layout, Slot, build_layout, format_table
 from oscpacer import OscPacer
-from rnbo import Param, fetch_tree, graph_signature, instance_names, parse_params
+from rnbo import Param, fetch_graph, graph_signature, instance_names, parse_params
 
 log = logging.getLogger("ec4bridge")
 
@@ -172,7 +172,7 @@ def local_ip_for(host: str) -> str:
 
 
 def fetch_params(cfg: dict) -> list[Param]:
-    return parse_params(fetch_tree(cfg["runner_host"], cfg["oscquery_port"]))
+    return parse_params(fetch_graph(cfg["runner_host"], cfg["oscquery_port"]))
 
 
 class Bridge:
@@ -837,7 +837,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
             params = None
             if need_full:
                 t_poll = time.monotonic()
-                tree = fetch_tree(host, port)
+                tree = fetch_graph(host, port, known)
                 params = parse_params(tree)
                 known = instance_names(tree)
                 signature = graph_signature(host, port, known)
@@ -846,8 +846,8 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
                 took = last_full - t_poll
                 if took > 0.25 and time.monotonic() - slow_logged > 60:
                     slow_logged = time.monotonic()
-                    log.info("reading the graph from the runner took %d ms (%d parameters); this "
-                             "now only happens when the graph changes", took * 1000, len(params))
+                    log.info("reading the graph from the runner took %d ms (%d parameters, in small "
+                             "pieces); this only happens when the graph changes", took * 1000, len(params))
             if not runner_ok:
                 log.info("runner reachable; registering OSC listener %s", listener)
                 client.send_message("/rnbo/listeners/add", listener)
