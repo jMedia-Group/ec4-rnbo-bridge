@@ -156,6 +156,14 @@ filter sweeps. It is untested on hardware. Try `encoder_mode: "Acc3"` with it, o
 
 ## Troubleshooting
 
+- **"Receive error" on the EC4 during `send-layout`**: something else reached the EC4 in the middle
+  of the dump. `send-layout` and `capture-backup` pause a running bridge service automatically
+  (they create `ec4bridge.pause`, and the log shows "setup dump in progress"). If it still happens:
+  stop the service first (`sudo systemctl stop ec4bridge`), make sure nothing else is sending to
+  the EC4's MIDI in socket, and slow the transfer with `"sysex_page_pause_ms": 20`. A rejected dump
+  leaves your setups as they were or partly written; running `send-layout` again restores all of
+  them from the backup.
+
 - `No MIDI port matching 'EC4'`: run `aconnect -l` and put part of the EC4's name in `midi_port`.
 - `Could not reach the RNBO runner`: check `curl http://127.0.0.1:5678/rnbo/inst`.
 - Encoders do nothing: make sure the EC4 is on the RNBO setup, and check the log for "EC4 connected".

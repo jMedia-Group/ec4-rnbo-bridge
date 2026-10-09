@@ -62,6 +62,7 @@ DEFAULTS = {
     "backup_syx": "ec4-backup.syx",
     "layout_syx": "ec4-layout.syx",
     "layout_txt": "layout.txt",
+    "pause_file": "ec4bridge.pause",
     "sysex_page_pause_ms": 2,
     "live_names": True,
     "live_names_refresh": 0,
@@ -83,7 +84,7 @@ def load_config(path: str | None) -> dict:
         cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
     elif path:
         log.warning("config file %s not found, using defaults", path)
-    for k in ("backup_syx", "layout_syx", "layout_txt"):
+    for k in ("backup_syx", "layout_syx", "layout_txt", "pause_file"):
         if not os.path.isabs(cfg[k]):
             cfg[k] = os.path.join(base, cfg[k])
     if not 1 <= int(cfg["ec4_setup"]) <= 16:
@@ -146,6 +147,8 @@ class Bridge:
         self.cur_setup: int | None = None  # as reported by the EC4 (0-based); None = unknown
         self.cur_group: int | None = None
         self._overlay_timer: threading.Timer | None = None
+        self.hold = False  # True while this process itself is transferring a dump
+        self._was_paused = False
 
     # ---- layout ------------------------------------------------------------
     def update_from_params(self, params: list[Param]) -> bool:
@@ -230,8 +233,21 @@ class Bridge:
             log.info("EC4 switched to setup %d; pausing until it's back on setup %d",
                      self.cur_setup + 1, self.my_setup + 1)
 
+    def paused(self) -> bool:
+        """True while a setup dump is going to/from the EC4 (send-layout / capture-backup).
+
+        Anything else sent to the EC4 during a dump (a value CC, a name update) lands inside
+        the SysEx stream and the EC4 rejects the whole dump with 'receive error'.
+        """
+        if self.hold:
+            return True
+        try:
+            return time.time() - os.path.getmtime(self.cfg["pause_file"]) < 600  # ignore stale files
+        except (OSError, KeyError):
+            return False
+
     def _send_sysex(self, data: bytes):
-        if self.midi is not None and getattr(self.midi, "connected", True):
+        if self.midi is not None and getattr(self.midi, "connected", True) and not self.paused():
             self.midi.send_sysex(data)
 
     def request_ec4_state(self):
@@ -292,7 +308,7 @@ class Bridge:
 
     # ---- EC4 -> runner -----------------------------------------------------
     def on_cc(self, channel: int, cc: int, value: int):
-        if not self.on_my_setup():
+        if not self.on_my_setup() or self.paused():
             return  # the EC4 is on one of your other setups
         if self.hi_res:
             if self.cc_base <= cc < self.cc_base + 16:
@@ -347,13 +363,14 @@ class Bridge:
         return [(slot.group, cc, round(v * 127))]
 
     def _feedback(self, slot: Slot, v: float):
-        if self.midi is None or not self.on_my_setup():
+        if self.midi is None or not self.on_my_setup() or self.paused():
             return
         self.midi.send_ccs(self._cc_messages(slot, v), pause=0)
 
     def resync(self):
         """Send every current value to the EC4."""
-        if self.midi is None or not getattr(self.midi, "connected", True) or not self.on_my_setup():
+        if (self.midi is None or not getattr(self.midi, "connected", True)
+                or not self.on_my_setup() or self.paused()):
             return
         with self.lock:
             msgs = []
@@ -437,6 +454,17 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
             if reconnected and not changed:
                 bridge.resync()
                 bridge.write_names()
+            if bridge.paused():
+                if not bridge._was_paused:
+                    log.info("setup dump in progress; not sending anything to the EC4")
+                bridge._was_paused = True
+            elif bridge._was_paused:
+                bridge._was_paused = False
+                log.info("setup dump finished; resending values and names")
+                bridge.cur_setup = bridge.cur_group = None
+                bridge.request_ec4_state()
+                bridge.resync()
+                bridge.write_names()
             refresh = float(cfg["live_names_refresh"] or 0)
             if refresh and time.monotonic() - last_refresh >= refresh:
                 last_refresh = time.monotonic()
@@ -474,6 +502,31 @@ def cmd_list(cfg: dict, args) -> int:
     return 0
 
 
+class pause_bridge:
+    """Context manager: tell a running bridge service to stay quiet during a dump."""
+
+    def __init__(self, cfg: dict, settle: float = 0.5):
+        self.path = cfg["pause_file"]
+        self.settle = settle
+
+    def __enter__(self):
+        try:
+            with open(self.path, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError as exc:
+            print(f"Warning: could not pause the bridge service ({exc}).")
+            print("If it's running, stop it first: sudo systemctl stop ec4bridge")
+        time.sleep(self.settle)  # let anything already on its way to the EC4 go out first
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+        return False
+
+
 def _capture(cfg: dict, timeout: float) -> bytes | None:
     q: queue.Queue[bytes] = queue.Queue()
     midi = open_midi(cfg, on_sysex=q.put)
@@ -501,7 +554,8 @@ def _capture(cfg: dict, timeout: float) -> bytes | None:
 
 
 def cmd_capture_backup(cfg: dict, args) -> int:
-    msg = _capture(cfg, args.timeout)
+    with pause_bridge(cfg):
+        msg = _capture(cfg, args.timeout)
     if msg is None:
         return 1
     try:
@@ -558,6 +612,11 @@ def cmd_send_layout(cfg: dict, args) -> int:
     print(f"\nThis overwrites ALL 16 setups on the EC4: setup {cfg['ec4_setup']} gets the RNBO layout,"
           f"\nthe others are restored from the backup taken {age / 3600:.1f} h ago.")
     print("On the EC4: open the 'Receive' menu; the display shows 'Work in progress'.")
+    with pause_bridge(cfg):  # a running service must not talk to the EC4 during the dump
+        return _send_layout(cfg, args, data)
+
+
+def _send_layout(cfg: dict, args, data: bytes) -> int:
     if not args.yes:
         try:
             input("Press Enter when the EC4 is waiting to receive (Ctrl-C to cancel) ")
@@ -565,6 +624,7 @@ def cmd_send_layout(cfg: dict, args) -> int:
             print("\nCancelled.")
             return 1
     bridge = Bridge(cfg)
+    bridge.hold = True  # stay silent until the dump is out
     midi = open_midi(cfg, on_sysex=bridge.on_sysex)
     bridge.midi = midi
     try:
@@ -581,6 +641,8 @@ def cmd_send_layout(cfg: dict, args) -> int:
         midi.send_sysex_chunks(chunks, pause, progress)
         print("\nDone. The EC4 shows the progress and returns to normal when finished.")
         time.sleep(3)
+        bridge.hold = False
+        bridge.cfg = dict(cfg, pause_file="")  # our own pause file is still there; ignore it
         bridge.request_ec4_state()  # so names only go to the screen if the RNBO setup is showing
         time.sleep(1)
         bridge.update_from_params(fetch_params(cfg))  # sends all current values and live names

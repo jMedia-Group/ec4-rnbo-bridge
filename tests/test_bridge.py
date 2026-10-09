@@ -411,10 +411,12 @@ class RemoteProtocolTests(unittest.TestCase):
 
 
 class LiveDisplayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
     def make(self, **kw):
         self.midi = FakeMidi()
         self.osc = []
-        self.tmp = tempfile.TemporaryDirectory()
         d = self.tmp.name
         c = cfg(layout_txt=os.path.join(d, "l.txt"), backup_syx=os.path.join(d, "none.syx"),
                 notify_seconds=0.1, **kw)
@@ -495,6 +497,35 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_sysex(report(15, 2))
         self.assertFalse(any(m[7:10] == bytes([0x4E, 0x22, 0x13]) for m in self.midi.sysex))
         self.assertTrue(self.names_written())
+
+    def test_quiet_during_dump(self):
+        import ec4bridge
+        pause = os.path.join(self.tmp.name, "ec4bridge.pause")
+        b = self.make(pause_file=pause)
+        self.midi.sent.clear()
+        self.midi.sysex.clear()
+        with ec4bridge.pause_bridge(b.cfg, settle=0):
+            self.assertTrue(os.path.exists(pause))
+            b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.9)  # a moving parameter
+            b.resync()
+            b.write_names()
+            b.notify(["x"])
+            b.on_sysex(report(15, 2))  # even a group change must not trigger output
+            b.on_cc(0, 16, 64)
+        self.assertEqual(self.midi.sent, [])
+        self.assertEqual(self.midi.sysex, [])
+        self.assertEqual(self.osc, [])
+        self.assertFalse(os.path.exists(pause))
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.5)  # back to normal afterwards
+        self.assertEqual(self.midi.sent, [(2, 18, 64)])
+
+    def test_stale_pause_file_ignored(self):
+        pause = os.path.join(self.tmp.name, "old.pause")
+        open(pause, "w").close()
+        old = time.time() - 3600
+        os.utime(pause, (old, old))
+        b = self.make(pause_file=pause)
+        self.assertFalse(b.paused())
 
     def test_live_names_off(self):
         self.make(live_names=False, notify_graph_change=False)
