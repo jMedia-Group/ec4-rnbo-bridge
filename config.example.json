@@ -26,6 +26,11 @@
   "strip_prefixes": ["j."],
   "name_case": "keep",
 
+  "live_names": true,
+  "notify_graph_change": true,
+  "notify_seconds": 2.5,
+  "live_names_refresh": 0,
+
   "backup_syx": "ec4-backup.syx",
   "layout_syx": "ec4-layout.syx",
   "layout_txt": "layout.txt",

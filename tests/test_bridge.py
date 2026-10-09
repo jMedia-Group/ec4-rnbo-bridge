@@ -29,9 +29,13 @@ class FakeMidi:
 
     def __init__(self):
         self.sent = []
+        self.sysex = []
 
     def send_ccs(self, msgs, pause=0):
         self.sent += msgs
+
+    def send_sysex(self, data):
+        self.sysex.append(bytes(data))
 
 
 def cfg(**kw):
@@ -353,6 +357,168 @@ class RunLoopTest(unittest.TestCase):
                 runner.close()
         self.assertFalse(t.is_alive())
         self.assertIn(("/rnbo/listeners/del", (f"127.0.0.1:{listen_port}",)), got)
+
+
+import ec4_remote as rm  # noqa: E402
+
+
+def report(setup=None, group=None):
+    body = []
+    if setup is not None:
+        body += [0x4E, 0x28, 0x10 + setup]
+    if group is not None:
+        body += [0x4E, 0x24, 0x10 + group]
+    return bytes([*rm.HEADER, *body, 0xF7])
+
+
+class RemoteProtocolTests(unittest.TestCase):
+    """Byte layout must match DrivenByMoss' EC4Display/EC4ControlSurface."""
+
+    def test_names_page_bytes(self):
+        m = rm.names_page(["Ab", None] + [None] * 14)
+        self.assertEqual(m[:13], bytes([0xF0, 0, 0, 0, 0x4E, 0x2C, 0x1B, 0x4E, 0x22, 0x10, 0x4A, 0x20, 0x10]))
+        self.assertEqual(m[13:19], bytes([0x4D, 0x24, 0x11, 0x4D, 0x26, 0x12]))  # 'A' 0x41, 'b' 0x62
+        self.assertEqual(len(m), 13 + 64 * 3 + 1)
+        self.assertEqual(m[-1], 0xF7)
+
+    def test_overlay_and_requests(self):
+        self.assertEqual(rm.overlay_show(True)[-4:], bytes([0x4E, 0x22, 0x14, 0xF7]))
+        self.assertEqual(rm.overlay_show(False)[-4:], bytes([0x4E, 0x22, 0x15, 0xF7]))
+        self.assertEqual(rm.overlay_text(["x"])[7:10], bytes([0x4E, 0x22, 0x13]))
+        self.assertEqual(len(rm.overlay_text([])), 13 + 80 * 3 + 1)
+        self.assertEqual(rm.REQUEST_INFO, bytes([0xF0, 0, 0, 0, 0x4E, 0x20, 0x10, 0xF7]))
+
+    def test_parse_report(self):
+        self.assertEqual(rm.parse_report(report(15, 0)), {"setup": 15, "group": 0})
+        self.assertEqual(rm.parse_report(report(group=3)), {"group": 3})
+        self.assertIsNone(rm.parse_report(bytes([0xF0, 0, 0, 0, 0x41, 0xF7])))
+        self.assertIsNone(rm.parse_report(rm.REQUEST_INFO))
+
+
+class LiveDisplayTests(unittest.TestCase):
+    def make(self, **kw):
+        self.midi = FakeMidi()
+        self.osc = []
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        c = cfg(layout_txt=os.path.join(d, "l.txt"), backup_syx=os.path.join(d, "none.syx"),
+                notify_seconds=0.1, **kw)
+        b = Bridge(c, midi=self.midi, osc_send=lambda a, v: self.osc.append((a, v)))
+        b.update_from_params(parse_params(default_tree()))
+        return b
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def names_written(self):
+        return [m for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x10])]
+
+    @staticmethod
+    def text(m):
+        return "".join(chr(((m[i + 1] & 0xF) << 4) | (m[i + 2] & 0xF)) for i in range(13, len(m) - 1, 3))
+
+    def test_names_written_on_start_and_group_change(self):
+        b = self.make()
+        pages = self.names_written()
+        self.assertEqual(len(pages), 1)
+        self.assertTrue(self.text(pages[0]).startswith("volmCutfresnatck"))
+        b.on_sysex(report(15, 2))  # user selects group 3 on the RNBO setup
+        self.assertTrue(self.text(self.names_written()[-1]).startswith("timefedbmix "))
+        b.on_sysex(report(15, 9))  # empty group -> blank names
+        self.assertEqual(self.text(self.names_written()[-1]), " " * 64)
+
+    def test_other_setup_is_left_alone(self):
+        b = self.make()
+        b.on_sysex(report(3, 0))  # user switches the EC4 to their own setup 4
+        self.midi.sent.clear()
+        self.midi.sysex.clear()
+        b.on_cc(0, 16, 100)  # that setup's encoder must not move RNBO
+        self.assertEqual(self.osc, [])
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.5)  # and no feedback goes out
+        b.update_from_params(parse_params(default_tree()))
+        self.assertEqual(self.midi.sent, [])
+        self.assertEqual(self.names_written(), [])
+        b.on_sysex(report(15, 0))  # back on the RNBO setup -> values + names resent
+        self.assertEqual(len(self.midi.sent), 23)
+        self.assertEqual(len(self.names_written()), 1)
+        b.on_cc(0, 16, 127)
+        self.assertEqual(self.osc[-1], ("/rnbo/inst/0/params/volume/normalized", 1.0))
+
+    def test_graph_change_notifies_and_renames(self):
+        b = self.make()
+        self.midi.sysex.clear()
+        tree = default_tree()
+        tree["CONTENTS"].pop("0")  # load a different graph
+        self.assertTrue(b.update_from_params(parse_params(tree)))
+        overlay = [m for m in self.midi.sysex if m[7:10] == bytes([0x4E, 0x22, 0x13])]
+        self.assertEqual(len(overlay), 1)
+        self.assertIn("RNBO graph loaded", self.text(overlay[0]))
+        self.assertIn(" 1 Delay", self.text(overlay[0]))
+        self.assertIn(rm.overlay_show(True), self.midi.sysex)
+        self.assertTrue(self.text(self.names_written()[-1]).startswith("timefedbmix "))
+        time.sleep(0.3)
+        self.assertEqual(self.midi.sysex[-1], rm.overlay_show(False))  # overlay hidden again
+
+    def test_live_names_off(self):
+        self.make(live_names=False, notify_graph_change=False)
+        self.assertEqual(self.midi.sysex, [])
+
+
+class FakeEC4(FakeMidi):
+    """Answers state requests like an EC4 on setup 3, group 1."""
+
+    def __init__(self, on_sysex):
+        super().__init__()
+        self.on_sysex = on_sysex
+        self.connected = False
+
+    def ensure_connected(self):
+        self.connected = True
+        return True
+
+    def close(self):
+        pass
+
+    def send_sysex(self, data):
+        super().send_sysex(data)
+        if data == rm.REQUEST_INFO:
+            self.on_sysex(report(2, 0))
+
+
+class TestDisplayCommandTests(unittest.TestCase):
+    def test_display_check(self):
+        import contextlib
+        import io
+
+        import ec4bridge
+        holder = {}
+
+        def fake_open(c, **kw):
+            holder["ec4"] = FakeEC4(kw["on_sysex"])
+            return holder["ec4"]
+
+        orig_open, orig_sleep = ec4bridge.open_midi, ec4bridge.time.sleep
+        ec4bridge.open_midi = fake_open
+        ec4bridge.time.sleep = lambda s: None
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = ec4bridge.cmd_test_display(cfg(), argparse_ns())
+        finally:
+            ec4bridge.open_midi, ec4bridge.time.sleep = orig_open, orig_sleep
+        text = out.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("EC4 reports setup 3, group 1", text)
+        self.assertIn("names only appear while the EC4 is on setup 16", text)
+        sent = holder["ec4"].sysex
+        self.assertIn(rm.overlay_show(True), sent)
+        self.assertEqual(sent[-1], rm.overlay_show(False))
+        self.assertFalse(any(m[7:9] == bytes([0x4E, 0x28]) for m in sent))  # never asks to switch setup
+
+
+def argparse_ns(**kw):
+    import argparse
+    return argparse.Namespace(**kw)
 
 
 class CliTests(unittest.TestCase):
