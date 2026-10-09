@@ -106,12 +106,14 @@ The names page shows names; if you've pressed BAR or NUM to show values, press N
 
 ```
 Filter Cutoff
-1240
+1240 Hz
 ##########.....  67%
 polysynth
 ```
 
-The value is RNBO's real value, as reported back by the runner (enums show their label). It
+The value is RNBO's real value, as reported back by the runner (enums show their label), with
+its unit: set it on the parameter in your patch (`param cutoff @unit Hz`), or in `units` in
+`config.json`. It
 disappears 1.5 s after you stop turning (`value_popup`, `value_popup_seconds`).
 
 To check, run `venv/bin/python ec4bridge.py test-display` with the EC4 on the RNBO setup. It asks
@@ -183,6 +185,7 @@ Edit `User=` and the paths in the service file if you don't use `/home/pi/ec4-rn
 | `device_list_seconds` | 8 | toggle mode: how long the list stays up; momentary mode: safety timeout |
 | `notify_group_change` | `true` | pop up the instance name when you switch groups |
 | `value_popup` | `true` | while you turn an encoder, show its full name, value, a level bar and the device |
+| `units` | `{}` | units shown after values in the pop-up, keyed like `names` (`{"0/cutoff": "Hz", "attack": "ms"}`); overrides the unit from RNBO |
 | `value_popup_seconds` | 1.5 | how long that stays after you stop turning |
 | `zero_unused` | `true` | set every encoder without a parameter to 0 (on a new graph, at start-up and when you return to the RNBO setup), so no values are left over from the previous graph |
 | `live_names_refresh` | 0 | rewrite the names every N seconds (only if the EC4 ever shows stale names) |

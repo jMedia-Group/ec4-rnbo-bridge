@@ -360,6 +360,16 @@ class BridgeTests(unittest.TestCase):
         b.update_from_params(parse_params(tree))
         self.assertEqual(self.midi.sent, [])
 
+    def test_echo_of_feedback_is_not_a_turn(self):
+        b = self.make()
+        time.sleep(0.01)
+        b.on_osc("/rnbo/inst/1/params/mix/normalized", 0.5)  # changed in the web UI
+        self.assertEqual(self.midi.sent[-1], (2, 18, 64))
+        b.on_cc(2, 18, 64)  # EC4 echoes it straight back (MIDI thru/merge)
+        self.assertEqual(self.osc, [])  # not sent to RNBO as a turn
+        b.on_cc(2, 18, 65)  # a real turn
+        self.assertEqual(self.osc, [("/rnbo/inst/1/params/mix/normalized", 65 / 127)])
+
     def test_feedback_and_holdoff(self):
         b = self.make()
         self.midi.sent.clear()
@@ -371,6 +381,14 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.midi.sent, [])
         b.on_osc("/rnbo/inst/1/params/mix", 0.5)  # raw value address is ignored
         self.assertEqual(self.midi.sent, [])
+
+    def test_warns_when_ec4_sends_14bit_but_config_is_7bit(self):
+        b = self.make()
+        with self.assertLogs("ec4bridge", level="WARNING") as logs:
+            b.on_cc(0, 48, 33)  # fine half of a 14-bit pair
+            b.on_cc(0, 48, 34)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("14-bit", logs.output[0])
 
     def test_14bit(self):
         b = self.make(resolution="14bit", feedback_holdoff_ms=250)
@@ -837,6 +855,26 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_cc(0, 17, 64)
         self.assertEqual(self.overlays(), [])
         b._hide_overlay()
+
+    def test_value_popup_units(self):
+        from mock_runner import make_instance
+        tree = {"CONTENTS": {"0": make_instance(0, "synth", [
+            ("cutoff", 0, 1000.0, 20.0, 20000.0, "Cutoff", None, 0, None, "Hz"),
+            ("attack", 1, 10.0, 0.0, 1000.0, "", None, 0, None, None, '{"unit": "ms"}'),
+            ("drive", 2, 0.5),
+            ("wave", 3, 1, 0, 1, "", None, 3, ["sine", "saw", "square"], "Hz"),
+        ])}}
+        params = parse_params(tree)
+        self.assertEqual([p.unit for p in params], ["Hz", "ms", "", "Hz"])
+        self.midi = FakeMidi()
+        b = Bridge(cfg(layout_txt=os.path.join(self.tmp.name, "l.txt"), backup_syx="none",
+                       units={"drive": "dB"}), midi=self.midi)
+        b.update_from_params(params)
+        lines = lambda i: b.value_popup_lines(b.layout.slots[i], None)
+        self.assertEqual(lines(0)[1], "1000 Hz")
+        self.assertEqual(lines(1)[1], "10 ms")
+        self.assertEqual(lines(2)[1], "0.500 dB")  # from config
+        self.assertEqual(lines(3)[1], "saw")  # enums never get a unit
 
     def test_format_value(self):
         f = Bridge.format_value

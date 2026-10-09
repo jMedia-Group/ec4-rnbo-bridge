@@ -22,6 +22,7 @@ class Param:
     value: float | str | None = None  # current raw value (enum: its label)
     min: float | None = None
     max: float | None = None
+    unit: str = ""  # RNBO @unit (e.g. "Hz"), or "unit" in the parameter's meta
 
     @property
     def key(self) -> str:
@@ -106,6 +107,16 @@ def parse_params(tree: dict) -> list[Param]:
                         except (TypeError, ValueError):
                             lo = hi = None
                     raw = _value(cnode)
+                    unit = str(_value(_child(cnode, "unit"), "") or "")
+                    if not unit:
+                        meta = _value(_child(cnode, "meta"), "")
+                        if isinstance(meta, str) and meta.strip().startswith("{"):
+                            try:
+                                m = json.loads(meta)
+                                if isinstance(m, dict) and isinstance(m.get("unit"), str):
+                                    unit = m["unit"]
+                            except ValueError:
+                                pass
                     found.append(Param(
                         inst=int(key),
                         inst_name=str(name),
@@ -120,6 +131,7 @@ def parse_params(tree: dict) -> list[Param]:
                         value=raw if isinstance(raw, (int, float, str)) else None,
                         min=lo,
                         max=hi,
+                        unit=unit.strip(),
                     ))
                 elif cnode.get("CONTENTS"):
                     walk(cnode, path)  # subpatcher folder

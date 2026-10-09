@@ -41,6 +41,7 @@
   "zero_unused": true,
   "value_popup": true,
   "value_popup_seconds": 1.5,
+  "units": { "0/cutoff": "Hz" },
 
   "backup_syx": "ec4-backup.syx",
   "layout_syx": "ec4-layout.syx",

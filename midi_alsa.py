@@ -7,6 +7,7 @@ the bridge share the EC4 with the RNBO runner (and a2jmidid) at the same time.
 
 from __future__ import annotations
 
+import errno
 import threading
 import time
 from typing import Callable
@@ -32,6 +33,7 @@ class EC4Midi:
         self.on_sysex = on_sysex
         self.log = log
         self._in = SequencerClient(CLIENT_NAME + "-in")
+        self._enlarge_input_buffer()
         self._out = SequencerClient(CLIENT_NAME + "-out")
         self._in_port = self._in.create_port("from EC4", caps=PortCaps.WRITE | PortCaps.SUBS_WRITE | PortCaps.NO_EXPORT,
                                              type=PortType.MIDI_GENERIC | PortType.APPLICATION)
@@ -47,6 +49,22 @@ class EC4Midi:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._reader, name="ec4-midi-in", daemon=True)
         self._thread.start()
+
+    def _enlarge_input_buffer(self):
+        """ALSA's default input queue is small; if Python is briefly busy (e.g. reading a large
+        graph from the runner) knob messages overflow it and are lost ('No space left on device')."""
+        try:
+            pool = self._in.get_client_pool()
+            pool.input_pool = max(pool.input_pool, 1000)
+            self._in.set_client_pool(pool)
+        except Exception as exc:  # pragma: no cover - depends on kernel limits
+            self.log(f"could not enlarge MIDI input pool: {exc}")
+        try:
+            self._in.set_input_buffer_size(max(self._in.get_input_buffer_size(), 65536))
+        except Exception as exc:  # pragma: no cover
+            self.log(f"could not enlarge MIDI input buffer: {exc}")
+        self._overruns = 0
+        self._overrun_logged = 0.0
 
     # ---- device discovery -------------------------------------------------
     def find_device(self):
@@ -150,8 +168,16 @@ class EC4Midi:
                 # no timeout: alsa-midi's timeout path busy-polls; this is a daemon thread anyway
                 ev = self._in.event_input()
             except Exception as exc:  # pragma: no cover - hardware path
+                if getattr(exc, "errno", None) == errno.ENOSPC or "No space left" in str(exc):
+                    # input queue overflowed: ALSA dropped some events; keep reading at once
+                    self._overruns += 1
+                    now = time.monotonic()
+                    if now - self._overrun_logged > 10:
+                        self._overrun_logged = now
+                        self.log(f"MIDI input overflow ({self._overruns} so far): some EC4 messages were lost")
+                    continue
                 self.log(f"MIDI input error: {exc}")
-                time.sleep(0.5)
+                time.sleep(0.05)
                 continue
             if ev is None:
                 continue

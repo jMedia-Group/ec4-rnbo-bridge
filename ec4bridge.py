@@ -72,6 +72,7 @@ DEFAULTS = {
     "zero_unused": True,
     "value_popup": True,
     "value_popup_seconds": 1.5,
+    "units": {},
     "notify_graph_change": True,
     "notify_seconds": 2.5,
     "notify_group_change": True,
@@ -194,6 +195,7 @@ class Bridge:
         self._rotate_timer: threading.Timer | None = None
         self.by_raw: dict[str, Slot] = {}
         self._polled: dict[str, float] = {}  # normalized values seen in the last poll
+        self._sent_cc: dict[tuple[int, int], tuple[int, float]] = {}  # what we last sent the EC4
         self.raw: dict[str, object] = {}  # latest exact raw value per parameter key
         self._popup_pending: tuple[Slot, object] | None = None
         self._popup_last = 0.0
@@ -426,10 +428,15 @@ class Bridge:
         norm = min(1.0, max(0.0, self.values.get(p.key, p.normalized)))
         if raw is None:
             raw = self.raw.get(p.key)
+        units = self.cfg.get("units") or {}
+        unit = units.get(p.key, units.get(p.pid, p.unit)) if not isinstance(raw, str) else ""
+        value = self.format_value(raw)
+        if value and unit:
+            value = f"{value} {unit}"
         filled = round(norm * 15)
         bar = "#" * filled + "." * (15 - filled) + f"{round(norm * 100):>4}%"
         device = strip_prefixes(p.inst_name, self.cfg.get("strip_prefixes") or [])
-        return [p.label[:20], self.format_value(raw)[:20], bar, device[:20]]
+        return [p.label[:20], value[:20], bar, device[:20]]
 
     def value_popup(self, slot: Slot, raw):
         """Full parameter name, value, bar and device on the overlay (throttled to ~12/s)."""
@@ -559,7 +566,10 @@ class Bridge:
     # ---- EC4 -> runner -----------------------------------------------------
     def on_cc(self, channel: int, cc: int, value: int):
         if not self.on_my_setup() or self.paused():
-            return  # the EC4 is on one of your other setups
+            return
+        sent = self._sent_cc.get((channel, cc))
+        if sent and sent[0] == value and time.monotonic() - sent[1] < 0.3:
+            return  # the EC4 echoing a value we just sent it, not a knob turn  # the EC4 is on one of your other setups
         if self.hi_res:
             if self.cc_base <= cc < self.cc_base + 16:
                 self.msb[(channel, cc)] = value
@@ -573,6 +583,12 @@ class Bridge:
             return
         if self.cc_base <= cc < self.cc_base + 16:
             self._set_from_ec4(channel, cc, value / 127.0)
+        elif self.cc_base + 32 <= cc < self.cc_base + 48 and not getattr(self, "_warned_14bit", False):
+            # the EC4 sends 14-bit pairs (CC n + CC n+32) but we're set to 7-bit: only the coarse
+            # half is read, so knobs lag and then jump
+            self._warned_14bit = True
+            log.warning("The EC4 is sending 14-bit values but resolution is '7bit'. Run 'send-layout' "
+                        "to reprogram the EC4 for 7-bit, or set \"resolution\": \"14bit\".")
 
     def _set_from_ec4(self, channel: int, cc: int, norm: float):
         with self.lock:
@@ -630,7 +646,11 @@ class Bridge:
     def _feedback(self, slot: Slot, v: float):
         if self.midi is None or not self.on_my_setup() or self.paused():
             return
-        self.midi.send_ccs(self._cc_messages(slot, v), pause=0)
+        msgs = self._cc_messages(slot, v)
+        now = time.monotonic()
+        for ch, cc, val in msgs:
+            self._sent_cc[(ch, cc)] = (val, now)
+        self.midi.send_ccs(msgs, pause=0)
 
     def resync(self):
         """Send every current value to the EC4."""
@@ -706,6 +726,7 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
 
     runner_ok = False
     last_refresh = time.monotonic()
+    slow_logged = 0.0
     log.info("bridge started; runner %s, EC4 match '%s', setup %s, %s",
              cfg["runner_host"], cfg["midi_port"], cfg["ec4_setup"], cfg["resolution"])
     while not stop.is_set():
@@ -718,7 +739,13 @@ def cmd_run(cfg: dict, args, stop: threading.Event | None = None) -> int:
         except Exception as exc:
             log.warning("MIDI port scan failed: %s", exc)
         try:
+            t_poll = time.monotonic()
             params = fetch_params(cfg)
+            took = time.monotonic() - t_poll
+            if took > 0.25 and time.monotonic() - slow_logged > 60:
+                slow_logged = time.monotonic()
+                log.info("reading the graph from the runner took %d ms (%d parameters); a larger "
+                         "poll_interval makes this happen less often", took * 1000, len(params))
             if not runner_ok:
                 log.info("runner reachable; registering OSC listener %s", listener)
                 client.send_message("/rnbo/listeners/add", listener)
@@ -940,7 +967,17 @@ def cmd_monitor(cfg: dict, args) -> int:
         prev = last.get((ch, cc))
         last[(ch, cc)] = (now, val)
         enc = cc - cc_base + 1 if cc_base <= cc < cc_base + 16 else None
-        where = f"group {ch + 1:>2} enc {enc:>2}" if enc else f"ch {ch + 1:>2} cc {cc:>3}"
+        fine = cc - cc_base - 31 if cc_base + 32 <= cc < cc_base + 48 else None
+        if enc:
+            where = f"group {ch + 1:>2} enc {enc:>2}       "
+        elif fine:
+            where = f"group {ch + 1:>2} enc {fine:>2} (fine)"
+            if not getattr(on_cc, "warned", False):
+                on_cc.warned = True
+                print("   (the EC4 sends 14-bit pairs: coarse value + fine value. If config.json says"
+                      " \"resolution\": \"7bit\", run send-layout to reprogram the EC4.)", flush=True)
+        else:
+            where = f"ch {ch + 1:>2} cc {cc:>3}            "
         if prev:
             dt = (now - prev[0]) * 1000
             step = val - prev[1]
@@ -949,7 +986,12 @@ def cmd_monitor(cfg: dict, args) -> int:
         else:
             print(f"{now - t0:8.3f}s  {where}  value {val:>3}", flush=True)
 
-    midi = open_midi(cfg, on_cc=on_cc)
+    def on_sysex(msg):
+        rep = ec4_remote.parse_report(msg)
+        what = ", ".join(f"{k}={v}" for k, v in rep.items()) if rep else f"{len(msg)} bytes"
+        print(f"{time.monotonic() - t0:8.3f}s  SysEx from EC4: {what}", flush=True)
+
+    midi = open_midi(cfg, on_cc=on_cc, on_sysex=on_sysex)
     try:
         midi.ensure_connected()
         if not midi.connected:

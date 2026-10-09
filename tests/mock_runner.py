@@ -15,15 +15,18 @@ def _leaf(path, value, typ="f", rng=None, access=3):
     return n
 
 
-def make_param(inst, pid, index, value, lo=0.0, hi=1.0, display="", order=None, steps=0, enum=None):
+def make_param(inst, pid, index, value, lo=0.0, hi=1.0, display="", order=None, steps=0, enum=None,
+               unit=None, meta=""):
     base = f"/rnbo/inst/{inst}/params/{pid}"
     norm = (value - lo) / (hi - lo) if enum is None else value / max(1, len(enum) - 1)
     contents = {
         "index": _leaf(base + "/index", index, "i", access=1),
         "display_name": _leaf(base + "/display_name", display, "s", access=1),
         "normalized": _leaf(base + "/normalized", norm, "f", [{"MIN": 0, "MAX": 1}]),
-        "meta": _leaf(base + "/meta", "", "s"),
+        "meta": _leaf(base + "/meta", meta, "s"),
     }
+    if unit is not None:
+        contents["unit"] = _leaf(base + "/unit", unit, "s", access=1)
     if order is not None:
         contents["display_order"] = _leaf(base + "/display_order", order, "i", access=1)
     if steps:
