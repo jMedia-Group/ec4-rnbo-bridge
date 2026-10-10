@@ -288,6 +288,10 @@ class Bridge:
         self._overlay_lines: list[str] = [""] * 4
         self._was_paused = False
         self.trace = Trace()  # timeline for diagnosing lag (see ec4trace.py)
+        # after a group/setup switch the names are written again after these delays (s): the EC4
+        # may redraw its stored "----" names after our first write has already arrived
+        self.names_resend = (0.3, 1.0)
+        self._names_timers: list[threading.Timer] = []
 
     # ---- layout ------------------------------------------------------------
     def update_from_params(self, params: list[Param]) -> bool:
@@ -372,22 +376,29 @@ class Bridge:
             self.cur_setup = rep.get("setup", self.cur_setup)
             self.cur_group = rep.get("group", self.cur_group)
             mine = self.on_my_setup()
-        if (self.cur_setup, self.cur_group) != (old_setup, old_group):
-            # the EC4 redraws its stored names (and may drop the pop-up) when you switch
+        if (self.cur_setup, self.cur_group) != (old_setup, old_group) or "group" in rep:
+            # the EC4 redraws its stored names (and may drop the pop-up) when you switch, and also
+            # when you press the group that's already selected
             self._invalidate_display(ec4_remote.DISPLAY_NAMES, visibility=True)
         if mine and not was_mine:
             log.info("EC4 is on the RNBO setup (%d), group %s", self.my_setup + 1,
                      "?" if self.cur_group is None else self.cur_group + 1)
             self.resync()
             self.write_names()
+            self._resend_names_later()
         elif mine and self.cur_group != old_group:
             self.write_names()
+            self._resend_names_later()
             list_was_open = self._list_page is not None
             self._list_page = None
             if old_group is not None and self.cfg["notify_group_change"] and self.cur_group is not None:
                 self.notify(self._group_summary(self.cur_group))
             elif list_was_open:
                 self._hide_overlay()
+        elif mine and "group" in rep:
+            # same group selected again: the EC4 has put its stored '----' back on screen
+            self.write_names()
+            self._resend_names_later()
         elif was_mine and not mine:
             log.info("EC4 switched to setup %d; pausing until it's back on setup %d",
                      self.cur_setup + 1, self.my_setup + 1)
@@ -445,6 +456,21 @@ class Bridge:
             g = self.cur_group if self.cur_group is not None else 0
             names = self.layout.encoder_names()[g] if 0 <= g < 16 else [None] * 16
         self._display_text(ec4_remote.DISPLAY_NAMES, 0, ec4_remote.names_text(names))
+
+    def _resend_names_later(self):
+        for t in self._names_timers:
+            t.cancel()
+        self._names_timers = []
+        for delay in self.names_resend:
+            t = threading.Timer(delay, self._rewrite_names)
+            t.daemon = True
+            t.start()
+            self._names_timers.append(t)
+
+    def _rewrite_names(self):
+        """Write the whole names screen again, whatever we think is on it."""
+        self._invalidate_display(ec4_remote.DISPLAY_NAMES)
+        self.write_names()
 
     def _graph_summary(self) -> list[str]:
         from layout import strip_prefixes

@@ -639,6 +639,42 @@ class LiveDisplayTests(unittest.TestCase):
         b.on_sysex(report(15, 9))  # empty group -> blank names
         self.assertEqual(self.text(self.names_written()[-1]), " " * 64)
 
+    def test_names_written_again_after_a_group_switch(self):
+        ec4 = SlowEC4(delay=0.0)
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none", notify_group_change=False),
+                   midi=ec4, osc_send=lambda a, v: None)
+        b.names_resend = (0.1,)
+        b.update_from_params(parse_params(default_tree()))
+        b.on_sysex(report(15, 0))
+        ec4.q.flush(2)
+        time.sleep(0.2)
+        b.on_sysex(report(15, 2))  # switch to group 3
+        ec4.q.flush(2)
+        names = lambda: [m for _, m in ec4.sysex if m[7:10] == bytes([0x4E, 0x22, 0x10])]
+        n = len(names())
+        # meanwhile the EC4 redraws its stored "----" names over ours; the bridge can't see that,
+        # so it writes the whole names screen once more shortly after
+        time.sleep(0.25)
+        ec4.q.flush(2)
+        self.assertEqual(len(names()), n + 1)
+        self.assertEqual(len(names()[-1]), 13 + 64 * 3 + 1)  # all 64 characters, not a diff
+        ec4.q.close()
+
+    def test_names_rewritten_when_same_group_pressed_again(self):
+        ec4 = SlowEC4(delay=0.0)
+        b = Bridge(cfg(layout_txt=os.devnull, backup_syx="none"), midi=ec4, osc_send=lambda a, v: None)
+        b.names_resend = ()
+        b.update_from_params(parse_params(default_tree()))
+        b.on_sysex(report(15, 2))
+        ec4.q.flush(2)
+        names = lambda: [m for _, m in ec4.sysex if m[7:10] == bytes([0x4E, 0x22, 0x10])]
+        n = len(names())
+        b.on_sysex(report(group=2))  # group 3 pressed again: the EC4 shows '----' again
+        ec4.q.flush(2)
+        self.assertEqual(len(names()), n + 1)
+        self.assertEqual(len(names()[-1]), 13 + 64 * 3 + 1)  # the whole screen
+        ec4.q.close()
+
     def test_other_setup_is_left_alone(self):
         b = self.make()
         b.on_sysex(report(3, 0))  # user switches the EC4 to their own setup 4
